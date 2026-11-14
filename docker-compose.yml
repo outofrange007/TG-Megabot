@@ -1,0 +1,26 @@
+services:
+  mega-bot:
+    build: .
+    image: tg-mega-bot
+    container_name: telegram-mega-bot
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      WORK_DIR: /work
+      DATA_DIR: /data
+    volumes:
+      # Bind-mount the script so code changes only need a restart,
+      # not a rebuild.
+      - ./tg-mega-bot.py:/app/tg-mega-bot.py:ro
+      # Persistent state: SQLite queue, dedup registry and Telethon session.
+      - mega-bot-data:/data
+      # Scratch space for downloads; grows to at most the largest file.
+      - mega-bot-work:/work
+      # Optional: for authenticated YouTube downloads, mount a cookies
+      # file exported from a browser (Netscape format) and set
+      # YT_COOKIES=/cookies.txt in .env.
+      # - ./cookies.txt:/cookies.txt:ro
+
+volumes:
+  mega-bot-data:
+  mega-bot-work:
