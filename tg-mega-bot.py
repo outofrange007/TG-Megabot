@@ -236,9 +236,20 @@ def init_db() -> None:
                 topic_id INTEGER,
                 requester INTEGER NOT NULL,
                 status TEXT NOT NULL DEFAULT 'pending',
-                error TEXT
+                error TEXT,
+                auto_folder_topics INTEGER NOT NULL DEFAULT 0
             )
         """)
+
+        # Migrate existing databases without disturbing queued jobs.
+        columns = {
+            row[1] for row in db.execute("PRAGMA table_info(jobs)").fetchall()
+        }
+        if "auto_folder_topics" not in columns:
+            db.execute(
+                "ALTER TABLE jobs ADD COLUMN auto_folder_topics "
+                "INTEGER NOT NULL DEFAULT 0"
+            )
 
         # Registry of forum topics the bot created or saw being created.
         db.execute("""
@@ -281,24 +292,30 @@ def add_jobs(
     links: list[str],
     topic_id: int | None,
     requester: int,
+    auto_folder_topics: bool = False,
 ) -> None:
     """Add new jobs to the persistent queue."""
     with closing(db_connect()) as db, db:
         db.executemany(
             """
-            INSERT INTO jobs (link, topic_id, requester, status)
-            VALUES (?, ?, ?, 'pending')
+            INSERT INTO jobs (
+                link, topic_id, requester, status, auto_folder_topics
+            )
+            VALUES (?, ?, ?, 'pending', ?)
             """,
-            [(link, topic_id, requester) for link in links],
+            [
+                (link, topic_id, requester, int(auto_folder_topics))
+                for link in links
+            ],
         )
 
 
-def claim_job() -> tuple[int, str, int | None] | None:
+def claim_job() -> tuple[int, str, int | None, bool] | None:
     """Get the oldest pending job and mark it as running."""
     with closing(db_connect()) as db, db:
         row = db.execute(
             """
-            SELECT id, link, topic_id
+            SELECT id, link, topic_id, auto_folder_topics
             FROM jobs
             WHERE status = 'pending'
             ORDER BY id
@@ -313,7 +330,7 @@ def claim_job() -> tuple[int, str, int | None] | None:
             "UPDATE jobs SET status = 'running' WHERE id = ?",
             (row[0],),
         )
-        return row
+        return (row[0], row[1], row[2], bool(row[3]))
 
 
 def finish_job(job_id: int, error: str | None = None) -> None:
@@ -1189,6 +1206,7 @@ async def iter_download(
     temp_dir: Path,
     job_id: int,
     stats: dict | None = None,
+    file_folders: dict[str, str | None] | None = None,
 ):
     """Download a MEGA link file by file, yielding each file as it arrives.
 
@@ -1199,7 +1217,8 @@ async def iter_download(
     listed, everything is downloaded in one bulk megadl run instead.
     Single file links are handled by megadl directly. The optional
     stats dict collects files skipped before any download; job_id is
-    stored with every recorded skip event.
+    stored with every recorded skip event. file_folders preserves the
+    original folder path for per-folder topic routing in the worker.
     """
     if RUNNING["cancel"]:
         raise JobCancelled()
@@ -1256,6 +1275,9 @@ async def iter_download(
             failed += 1
             log(f"[dl] Download failed for {name}: {exc}")
             continue
+
+        if file_folders is not None:
+            file_folders[str(path)] = mega_folder_for_file(name)
 
         yield path
 
@@ -1670,6 +1692,31 @@ def topic_error_hint(error: str) -> str:
     return ""
 
 
+def mega_folder_for_file(name: str) -> str | None:
+    """Return the top-level MEGA folder for a file path, or None for root files."""
+    parts = [part for part in name.replace("\\", "/").split("/") if part]
+    return parts[0] if len(parts) > 1 else None
+
+
+async def get_or_create_folder_topic(
+    folder_name: str,
+    topic_cache: dict[str, int],
+) -> int:
+    """Return the cached topic ID or create one for this MEGA folder."""
+    if folder_name in topic_cache:
+        return topic_cache[folder_name]
+
+    title = clamp_topic_name(folder_name)
+    if not title:
+        raise RuntimeError("MEGA folder name is empty; cannot create topic")
+
+    topic_id = await create_topic(title)
+    save_topic(topic_id, title)
+    topic_cache[folder_name] = topic_id
+    log(f"[topic] Created topic '{title}' (ID: {topic_id})")
+    return topic_id
+
+
 async def create_topic(name: str) -> int:
     """Create a forum topic and return its topic ID."""
     result = await client(
@@ -1819,7 +1866,7 @@ async def worker() -> None:
             await asyncio.sleep(2)
             continue
 
-        job_id, link, topic_id = job
+        job_id, link, topic_id, auto_folder_topics = job
         RUNNING.update(job_id=job_id, process=None, cancel=False)
         log(
             f"[worker] Claimed job #{job_id} "
@@ -1832,6 +1879,8 @@ async def worker() -> None:
             kept_count = 0  # files retained on the server
             skipped_count = 0  # duplicates found after download
             stats = {"skipped_pre": 0}
+            file_folders: dict[str, str | None] = {}
+            folder_topics: dict[str, int] = {}
 
             async def handle_downloaded(path: Path) -> None:
                 """Dedup-check, optimize and upload one downloaded file."""
@@ -1862,7 +1911,20 @@ async def worker() -> None:
                 original_size = path.stat().st_size
                 await asyncio.to_thread(optimize_video_faststart, path)
 
-                if await upload_one(path, topic_id):
+                file_topic_id = topic_id
+                folder_name = file_folders.pop(str(path), None)
+                if auto_folder_topics and folder_name:
+                    try:
+                        file_topic_id = await get_or_create_folder_topic(
+                            folder_name, folder_topics
+                        )
+                    except Exception as exc:
+                        raise RuntimeError(
+                            f"Could not create topic for MEGA folder "
+                            f"'{folder_name}': {exc}"
+                        ) from exc
+
+                if await upload_one(path, file_topic_id):
                     file_count += 1
                     mark_seen(hash_value, path.name, original_size, job_id)
                     path.unlink(missing_ok=True)
@@ -1899,7 +1961,11 @@ async def worker() -> None:
                     # MEGA: download and upload overlap file by file,
                     # so disk usage stays bounded by the largest file.
                     async for path in iter_download(
-                        link, Path(temp_dir), job_id, stats
+                        link,
+                        Path(temp_dir),
+                        job_id,
+                        stats,
+                        file_folders,
                     ):
                         await handle_downloaded(path)
 
@@ -1984,7 +2050,17 @@ async def on_mega(event) -> None:
         await event.reply(error)
         return
 
-    add_jobs(links, topic_id, event.sender_id)
+    auto_folder_topics = (
+        not NEWTOPIC_REGEX.search(text)
+        and not TOPIC_REGEX.search(text)
+        and get_topic_id(event) is None
+    )
+    add_jobs(
+        links,
+        topic_id,
+        event.sender_id,
+        auto_folder_topics=auto_folder_topics,
+    )
     _, pending = queue_status()
 
     acknowledgement = await event.reply(
