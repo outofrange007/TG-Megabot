@@ -118,11 +118,19 @@ BANDWIDTH_RETRY_DELAY = 60
 # Bytes fetched from the storage server per read (also the decrypt unit).
 DOWNLOAD_CHUNK = 1024 * 1024
 
-# Match new and legacy MEGA file/folder links.
+# Match new and legacy MEGA file/folder links. New-style links may end
+# with a subfolder or file path inside the share, e.g.
+# https://mega.nz/folder/<handle>#<key>/folder/<subhandle> — such links
+# make the bot download only that subfolder (or single file).
 MEGA_REGEX = re.compile(
     r"https?://mega\.(?:nz|io)/"
-    r"(?:(?:file|folder)/[\w-]+#[\w-]+|#F?![\w-]+![\w-]+)"
+    r"(?:(?:file|folder)/[\w-]+#[\w-]+(?:/(?:folder|file)/[\w-]+)*"
+    r"|#F?![\w-]+![\w-]+)"
 )
+
+# A new-style link may select a subfolder or a single file inside the
+# share, e.g. .../folder/<handle>#<key>/folder/<sub handle>.
+MEGA_SUBPATH_REGEX = re.compile(r"/(?:folder|file)/([\w-]+)/?$")
 
 # Match YouTube video/shorts/live URLs (youtu.be included).
 YT_REGEX = re.compile(
@@ -202,8 +210,11 @@ class JobCancelled(Exception):
 
 def link_kind(link: str) -> str:
     """Return 'file' or 'folder' for a MEGA link."""
-    # New-style links can combine both forms (a file shared through a
-    # folder link), so the file check must come first.
+    # A /folder/ share stays folder-based even when the link selects a
+    # file inside it (.../folder/<handle>#<key>/file/<file handle>):
+    # such files are only addressable with the folder as API context.
+    if "/folder/" in link:
+        return "folder"
     if "/file/" in link or "#!" in link:
         return "file"
     return "folder"
@@ -836,18 +847,19 @@ def request_folder_nodes(handle: str) -> list[dict]:
 def list_public_folder(link: str) -> list[tuple[str, str, int, bytes]]:
     """Turn a public folder link into downloadable file entries.
 
-    Returns (path name, node handle, size, key material) tuples.
+    Returns (path name, node handle, size, key material) tuples. A link
+    ending in a subfolder or file path limits the result to that
+    subtree of the share.
     """
     match = re.search(r"/folder/([\w-]+)#([\w-]+)", link)
     if not match:
         raise RuntimeError("Not a supported (new-style) folder link")
-
     handle, key_text = match.groups()
     folder_key = mega_d64(key_text)
-
+    sub_match = MEGA_SUBPATH_REGEX.search(link)
+    sub_handle = sub_match.group(1) if sub_match else None
     nodes = request_folder_nodes(handle)
     by_handle = {node["h"]: node for node in nodes}
-
     # Decrypt every node once; the names double as folder path parts.
     decrypted: dict[str, tuple[bytes, str | None]] = {}
     for node in nodes:
@@ -867,23 +879,44 @@ def list_public_folder(link: str) -> list[tuple[str, str, int, bytes]]:
             parts.append(name)
         return "/".join(reversed(parts))
 
+    # Restrict the download to the selected subtree: the target node
+    # itself and everything below it.
+    allowed: set[str] | None = None
+    if sub_handle:
+        if sub_handle not in by_handle:
+            raise RuntimeError(
+                "Selected subfolder or file is not part of the shared folder"
+            )
+        children: dict[str, list[str]] = {}
+        for node in nodes:
+            children.setdefault(node.get("p"), []).append(node["h"])
+        allowed = set()
+        stack = [sub_handle]
+        while stack:
+            current = stack.pop()
+            allowed.add(current)
+            stack.extend(children.get(current, ()))
+        target = decrypted.get(sub_handle, (None, None))[1] or sub_handle
+        log(f"[dl] Link selects '{target}'; downloading only that subtree")
+
     entries: list[tuple[str, str, int, bytes]] = []
     for node in nodes:
         # Only real files with content are queued (t=0, size > 0).
         if node.get("t") != 0 or not node.get("s"):
             continue
-
+        if allowed is not None and node["h"] not in allowed:
+            continue
         result = decrypted.get(node["h"])
         if result is None:
             log(f"[dl] Skipping file with undecryptable key: {node['h']}")
             continue
-
         material, name = result
         path = folder_path(node)
         label = f"{path}/{name}" if path else (name or node["h"])
         entries.append((label, node["h"], node["s"], material))
-
     entries.sort(key=lambda entry: entry[0])
+    if sub_handle and not entries:
+        raise RuntimeError("Selected subfolder contains no downloadable files")
     return entries
 
 
@@ -892,26 +925,30 @@ async def list_mega_files(link: str):
 
     Returns (name, node handle, size, key material) tuples, or None
     when listing is not possible, in which case the caller falls back
-    to one bulk download of the whole link.
+    to one bulk download of the whole link. Links that select a
+    subfolder or file never fall back: downloading the entire share
+    would be the opposite of what was asked for.
     """
     if link_kind(link) == "file":
         return None
-
     log(f"[dl] Listing folder contents of {link}")
-
+    # A link ending in a subfolder/file path must not silently degrade
+    # to a bulk download of the whole share when listing fails.
+    selects_subtree = bool(MEGA_SUBPATH_REGEX.search(link))
     try:
         # The listing is plain blocking HTTP; run it in a thread.
         entries = await asyncio.to_thread(list_public_folder, link)
     except Exception as exc:
+        if selects_subtree:
+            log(f"[dl] Listing the selected subfolder failed: {exc}")
+            raise
         log(f"[dl] Listing failed, falling back to bulk download: {exc}")
         return None
-
     total_size = sum(size for _, _, size, _ in entries)
     log(
         f"[dl] Folder contains {len(entries)} file(s), "
         f"{format_size(total_size)}"
     )
-
     return entries or None
 
 
