@@ -93,6 +93,14 @@ def env_mib(name: str, default: float) -> int:
     return int(value * 1024 * 1024)
 
 
+def env_float(name: str, default: float) -> float:
+    """Read a float env var, falling back to the default on bad input."""
+    try:
+        return float(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
 # Largest YouTube / Netzkino download accepted per video.
 YT_MAX_SIZE = env_mib("YT_MAX_SIZE", 1900)
 NZ_MAX_SIZE = env_mib("NZ_MAX_SIZE", 1900)
@@ -114,6 +122,13 @@ MEGA_API_RETRIES = 3
 # Download attempts per file and pause when MEGA's bandwidth limit hits.
 MEGA_DOWNLOAD_RETRIES = 3
 BANDWIDTH_RETRY_DELAY = 60
+
+# Anti-flood tuning for large folder shares: pause between two file
+# downloads, how many consecutive failures trigger a cooldown pause,
+# and how long that pause lasts. All three can be set via environment.
+MEGA_FILE_DELAY = env_float("MEGA_FILE_DELAY", 0.25)
+MEGA_FAIL_STREAK = int(env_float("MEGA_FAIL_STREAK", 10))
+MEGA_COOLDOWN = env_float("MEGA_COOLDOWN", 300)
 
 # Bytes fetched from the storage server per read (also the decrypt unit).
 DOWNLOAD_CHUNK = 1024 * 1024
@@ -153,6 +168,10 @@ NEWTOPIC_REGEX = re.compile(
     r"(?:^|\s)-newtopic\s+(.+?)(?=\s+-t\s|\s*https?://|\s*$)",
     re.IGNORECASE,
 )
+
+# Match an optional "-dupes" flag: re-transfer files the duplicate
+# registry already knows, instead of skipping them.
+DUPES_REGEX = re.compile(r"(?:^|\s)-dupes(?:\s|$)", re.IGNORECASE)
 
 # Queued jobs are prefixed with their source so the worker can pick the
 # right downloader: "yt:<url>" for YouTube, "nk:<url>" for Netzkino and
@@ -237,7 +256,8 @@ def init_db() -> None:
                 requester INTEGER NOT NULL,
                 status TEXT NOT NULL DEFAULT 'pending',
                 error TEXT,
-                auto_folder_topics INTEGER NOT NULL DEFAULT 0
+                auto_folder_topics INTEGER NOT NULL DEFAULT 0,
+                force_dupes INTEGER NOT NULL DEFAULT 0
             )
         """)
 
@@ -248,6 +268,11 @@ def init_db() -> None:
         if "auto_folder_topics" not in columns:
             db.execute(
                 "ALTER TABLE jobs ADD COLUMN auto_folder_topics "
+                "INTEGER NOT NULL DEFAULT 0"
+            )
+        if "force_dupes" not in columns:
+            db.execute(
+                "ALTER TABLE jobs ADD COLUMN force_dupes "
                 "INTEGER NOT NULL DEFAULT 0"
             )
 
@@ -293,29 +318,37 @@ def add_jobs(
     topic_id: int | None,
     requester: int,
     auto_folder_topics: bool = False,
+    force_dupes: bool = False,
 ) -> None:
     """Add new jobs to the persistent queue."""
     with closing(db_connect()) as db, db:
         db.executemany(
             """
             INSERT INTO jobs (
-                link, topic_id, requester, status, auto_folder_topics
+                link, topic_id, requester, status, auto_folder_topics,
+                force_dupes
             )
-            VALUES (?, ?, ?, 'pending', ?)
+            VALUES (?, ?, ?, 'pending', ?, ?)
             """,
             [
-                (link, topic_id, requester, int(auto_folder_topics))
+                (
+                    link,
+                    topic_id,
+                    requester,
+                    int(auto_folder_topics),
+                    int(force_dupes),
+                )
                 for link in links
             ],
         )
 
 
-def claim_job() -> tuple[int, str, int | None, bool] | None:
+def claim_job() -> tuple[int, str, int | None, bool, bool] | None:
     """Get the oldest pending job and mark it as running."""
     with closing(db_connect()) as db, db:
         row = db.execute(
             """
-            SELECT id, link, topic_id, auto_folder_topics
+            SELECT id, link, topic_id, auto_folder_topics, force_dupes
             FROM jobs
             WHERE status = 'pending'
             ORDER BY id
@@ -330,7 +363,7 @@ def claim_job() -> tuple[int, str, int | None, bool] | None:
             "UPDATE jobs SET status = 'running' WHERE id = ?",
             (row[0],),
         )
-        return (row[0], row[1], row[2], bool(row[3]))
+        return (row[0], row[1], row[2], bool(row[3]), bool(row[4]))
 
 
 def finish_job(job_id: int, error: str | None = None) -> None:
@@ -726,10 +759,22 @@ MEGA_API_ERRORS = {
     -2: "invalid arguments",
     -3: "rate limited, try again later",
     -4: "too many concurrent requests",
+    -5: "too many parallel downloads",
+    -6: "insufficient permissions",
+    -7: "file or folder not found",
+    -8: "circular linkage",
     -9: "object not found",
+    -10: "invalid or missing key",
     -11: "access denied",
+    -12: "not enough credits",
     -13: "quota exceeded",
+    -14: "invalid session",
+    -15: "content removed or blocked",
+    -16: "handle expired or rate limited (EEXPIRED)",
 }
+
+# Error codes worth retrying after a pause; all others fail instantly.
+MEGA_RETRYABLE_ERRORS = {-3, -4, -16}
 
 
 class MegaApiError(RuntimeError):
@@ -837,6 +882,22 @@ def mega_api(body: list, handle: str | None = None) -> dict:
 
             first = result[0]
             if isinstance(first, int):
+                # Transient errors (rate limits, expired public handle)
+                # get a short backoff before the caller sees them.
+                if (
+                    first in MEGA_RETRYABLE_ERRORS
+                    and attempt < MEGA_API_RETRIES
+                ):
+                    delay = 2 * attempt
+                    log(
+                        f"[mega] API error {first} "
+                        f"({MEGA_API_ERRORS.get(first, 'unknown')}); "
+                        f"retrying in {delay}s "
+                        f"({attempt + 1}/{MEGA_API_RETRIES})"
+                    )
+                    time.sleep(delay)
+                    continue
+
                 raise MegaApiError(first)
 
             return first
@@ -877,6 +938,12 @@ def list_public_folder(link: str) -> list[tuple[str, str, int, bytes]]:
     sub_handle = sub_match.group(1) if sub_match else None
     nodes = request_folder_nodes(handle)
     by_handle = {node["h"]: node for node in nodes}
+    # The share's top-level folder node(s); their names stay out of the
+    # reconstructed paths so topic routing sees the folders BELOW the
+    # share root instead of the share's own name.
+    root_handles = {
+        node["h"] for node in nodes if node.get("p") not in by_handle
+    }
     # Decrypt every node once; the names double as folder path parts.
     decrypted: dict[str, tuple[bytes, str | None]] = {}
     for node in nodes:
@@ -885,11 +952,13 @@ def list_public_folder(link: str) -> list[tuple[str, str, int, bytes]]:
             decrypted[node["h"]] = result
 
     def folder_path(node: dict) -> str:
-        """Reconstruct a node's path inside the shared folder."""
+        """Reconstruct a node's path below the share root."""
         parts: list[str] = []
         current = node
         while current.get("p") in by_handle:
             current = by_handle[current["p"]]
+            if current["h"] in root_handles:
+                break
             name = decrypted.get(current["h"], (None, None))[1]
             if name is None:
                 break
@@ -1207,6 +1276,7 @@ async def iter_download(
     job_id: int,
     stats: dict | None = None,
     file_folders: dict[str, str | None] | None = None,
+    force_dupes: bool = False,
 ):
     """Download a MEGA link file by file, yielding each file as it arrives.
 
@@ -1219,6 +1289,8 @@ async def iter_download(
     stats dict collects files skipped before any download; job_id is
     stored with every recorded skip event. file_folders preserves the
     original folder path for per-folder topic routing in the worker.
+    With force_dupes set, the duplicate checks are bypassed so files
+    already uploaded in earlier jobs are downloaded and sent again.
     """
     if RUNNING["cancel"]:
         raise JobCancelled()
@@ -1242,6 +1314,7 @@ async def iter_download(
 
     total = len(entries)
     failed = 0
+    fail_streak = 0
 
     for index, entry in enumerate(entries, start=1):
         if RUNNING["cancel"]:
@@ -1250,14 +1323,19 @@ async def iter_download(
         name, _, size, _ = entry
 
         # Skip files whose name and size match an upload the database
-        # already knows, before spending any download bandwidth.
-        if stats is not None and size and seen_by_name_size(
-            Path(name).name, size
+        # already knows, before spending any download bandwidth. The
+        # -dupes flag turns this off for the whole job.
+        if not force_dupes and stats is not None and size and (
+            seen_by_name_size(Path(name).name, size)
         ):
             stats["skipped_pre"] = stats.get("skipped_pre", 0) + 1
             mark_skipped(Path(name).name, size, "name/size", job_id)
             log(f"[dl] ({index}/{total}) Skipping {name}: already uploaded")
             continue
+
+        # Gentle pacing so huge shares do not trip MEGA rate limits.
+        if MEGA_FILE_DELAY > 0:
+            await asyncio.sleep(MEGA_FILE_DELAY)
 
         size_text = f" ({format_size(size)})" if size else ""
         log(f"[dl] ({index}/{total}) Downloading {name}{size_text}")
@@ -1273,8 +1351,32 @@ async def iter_download(
         except Exception as exc:
             # One broken file should not kill the whole folder job.
             failed += 1
+            fail_streak += 1
             log(f"[dl] Download failed for {name}: {exc}")
+
+            # A run of consecutive failures means MEGA is rate limiting
+            # or has expired the share handle; pushing on would only
+            # hammer the API harder, so pause and cool down instead.
+            if fail_streak >= MEGA_FAIL_STREAK and MEGA_COOLDOWN > 0:
+                log(
+                    f"[dl] {fail_streak} downloads failed in a row; "
+                    f"cooling down for {int(MEGA_COOLDOWN)}s before "
+                    "continuing"
+                )
+                waited = 0.0
+                while waited < MEGA_COOLDOWN:
+                    if RUNNING["cancel"]:
+                        raise JobCancelled()
+
+                    step = min(1.0, MEGA_COOLDOWN - waited)
+                    await asyncio.sleep(step)
+                    waited += step
+
+                fail_streak = 0
+
             continue
+
+        fail_streak = 0
 
         if file_folders is not None:
             file_folders[str(path)] = mega_folder_for_file(name)
@@ -1866,7 +1968,7 @@ async def worker() -> None:
             await asyncio.sleep(2)
             continue
 
-        job_id, link, topic_id, auto_folder_topics = job
+        job_id, link, topic_id, auto_folder_topics, force_dupes = job
         RUNNING.update(job_id=job_id, process=None, cancel=False)
         log(
             f"[worker] Claimed job #{job_id} "
@@ -1888,7 +1990,8 @@ async def worker() -> None:
 
                 hash_value = await asyncio.to_thread(file_hash, path)
 
-                if seen_file(hash_value):
+                # -dupes re-sends files the registry already knows.
+                if not force_dupes and seen_file(hash_value):
                     skipped_count += 1
                     mark_skipped(
                         path.name,
@@ -1966,6 +2069,7 @@ async def worker() -> None:
                         job_id,
                         stats,
                         file_folders,
+                        force_dupes,
                     ):
                         await handle_downloaded(path)
 
@@ -2026,7 +2130,7 @@ async def worker() -> None:
 # ---- Telegram commands ----
 @client.on(events.NewMessage(pattern=rf"^{GAP}/mega(?:@\w+)?{GAP}(?:\s|$)"))
 async def on_mega(event) -> None:
-    """/mega <link(s)> [-t topic_id] [-newtopic <name>] - queue MEGA links."""
+    """/mega <link(s)> [-t topic_id] [-newtopic <name>] [-dupes]."""
     if not is_allowed(event):
         return
 
@@ -2035,16 +2139,23 @@ async def on_mega(event) -> None:
     text = INVISIBLE_RE.sub("", event.raw_text)
     log(f"[mega] Command from {event.sender_id}: {text!r}")
 
+    # "-dupes" re-transfers files the duplicate registry already knows.
+    force_dupes = bool(DUPES_REGEX.search(text))
+    if force_dupes:
+        text = DUPES_REGEX.sub(" ", text)
+
     links = clean_urls(MEGA_REGEX.findall(text))
 
     if not links:
         await event.reply(
-            "Usage: /mega <mega-link(s)> [-t topic_id] [-newtopic <name>]"
+            "Usage: /mega <mega-link(s)> [-t topic_id] "
+            "[-newtopic <name>] [-dupes]"
         )
         return
 
     topic_id, error = await resolve_target_topic(
-        event, text, "Usage: /mega <mega-link(s)> -newtopic <name>"
+        event, text,
+        "Usage: /mega <mega-link(s)> -newtopic <name> [-dupes]",
     )
     if error:
         await event.reply(error)
@@ -2060,6 +2171,7 @@ async def on_mega(event) -> None:
         topic_id,
         event.sender_id,
         auto_folder_topics=auto_folder_topics,
+        force_dupes=force_dupes,
     )
     _, pending = queue_status()
 
@@ -2218,7 +2330,8 @@ async def on_help(event) -> None:
 
     await event.reply(
         "Available commands:\n"
-        "/mega <link(s)> [-t <topic_id>] [-newtopic <name>] - queue MEGA links\n"
+        "/mega <link(s)> [-t <topic_id>] [-newtopic <name>] [-dupes] - "
+        "queue MEGA links\n"
         "/yt <url(s)> [-t <topic_id>] [-newtopic <name>] - queue YouTube videos\n"
         "/nk <url(s)> [-t <topic_id>] [-newtopic <name>] - queue Netzkino movies\n"
         "/queue - show the running job and pending count\n"
