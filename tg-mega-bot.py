@@ -1588,6 +1588,9 @@ async def send_file(path: Path, topic_id: int | None, progress=None) -> None:
         CHAT_ID,
         str(path),
         force_document=False,
+        # MP4 videos get the streaming flag so Telegram offers instant
+        # playback instead of a plain file download.
+        supports_streaming=True,
         reply_to=topic_id,
         progress=progress,
     )
@@ -2065,52 +2068,166 @@ async def delete_status(messages: list, delay: int) -> None:
         print(f"Message deletion failed: {exc}", flush=True)
 
 
-# ---- Video faststart optimization ----
-# Telegram starts playback faster when the MP4 index sits at the front of
-# the file. Repack videos with FFmpeg (stream copy, no re-encoding) before
-# uploading. Other file types are left untouched.
+# ---- Video preparation for Telegram ----
+# Telegram streams videos best from MP4 files (H.264/AAC) whose index
+# sits at the front of the file ("faststart"). Every downloaded video
+# is therefore normalized before it is uploaded:
+#
+#   .mp4/.m4v/.mov    repacked with faststart; streams are copied.
+#   other containers  remuxed into MP4 (stream copy: fast, lossless).
+#
+# Codecs Telegram cannot play trigger a conversion: first only the
+# audio track is converted to AAC (the video stream is kept), and if
+# the video codec itself is unsupported (DivX, MPEG2, VP9, ...) the
+# whole video is re-encoded to H.264/AAC, which is slow. Non-video
+# files, and any video FFmpeg cannot process, are uploaded unchanged.
+# Set VIDEO_REENCODE=0 to disable the slow full re-encode.
+VIDEO_EXTENSIONS = {
+    ".mp4", ".m4v", ".mov", ".mkv", ".avi", ".webm", ".wmv", ".flv",
+    ".mpg", ".mpeg", ".ts", ".m2ts", ".3gp", ".ogv", ".vob",
+}
 FASTSTART_EXTENSIONS = {".mp4", ".m4v", ".mov"}
+VIDEO_REENCODE = (
+    os.environ.get("VIDEO_REENCODE", "1").strip().lower()
+    not in ("0", "false", "no")
+)
+
+# Seconds per FFmpeg run before it is killed and the original file is
+# uploaded unchanged instead.
+FFMPEG_TIMEOUT = 7200
 
 
-def optimize_video_faststart(path: Path) -> Path:
-    """Repack a video with its index in front (MP4 faststart).
+def probe_video_codecs(path: Path) -> tuple[bool, bool]:
+    """Check with ffprobe whether a video's codecs are Telegram-friendly.
 
-    Works in place: on success the original file is replaced by the
-    optimized one. Returns the path to upload; on any problem (FFmpeg
-    missing, repack failed) the original file is returned unchanged.
+    Returns (video_ok, audio_ok); ok means every stream of that kind
+    can be copied into an MP4 that Telegram plays. A file without an
+    audio stream counts as audio_ok, and any probe problem counts as
+    ok so the caller simply tries the lossless remux first.
     """
-    if path.suffix.lower() not in FASTSTART_EXTENSIONS:
+    command = [
+        "ffprobe", "-v", "error",
+        "-show_entries", "stream=codec_type,codec_name",
+        "-of", "json", str(path),
+    ]
+    try:
+        result = subprocess.run(
+            command, check=True, capture_output=True, timeout=60
+        )
+        streams = json.loads(result.stdout).get("streams", [])
+    except Exception as error:
+        log(f"[opt] Could not probe {path.name}: {error}")
+        return True, True
+
+    video_ok, audio_ok = True, True
+    for stream in streams:
+        if stream.get("disposition", {}).get("attached_pic"):
+            continue  # cover art, not a real video stream
+        codec = stream.get("codec_name", "")
+        if stream.get("codec_type") == "video":
+            video_ok = video_ok and codec in ("h264", "hevc", "h265")
+        elif stream.get("codec_type") == "audio":
+            audio_ok = audio_ok and codec in ("aac", "mp3")
+    return video_ok, audio_ok
+
+
+def _run_ffmpeg(command: list[str], what: str) -> bool:
+    """Run one FFmpeg command; return True on success.
+
+    The last element of the command must be the output file; it is
+    removed again when the run fails or writes nothing.
+    """
+    try:
+        log(f"[opt] {what}")
+        subprocess.run(command, check=True, timeout=FFMPEG_TIMEOUT)
+        if not os.path.getsize(command[-1]):
+            raise RuntimeError("no output was written")
+        return True
+    except Exception as error:
+        log(f"[opt] {what} failed: {error}")
+        Path(command[-1]).unlink(missing_ok=True)
+        return False
+
+
+def prepare_video_for_telegram(path: Path) -> Path:
+    """Bring one video into Telegram's preferred form: MP4 + faststart.
+
+    Returns the path to upload. On success the original download is
+    consumed (replaced in place, or renamed to .mp4); on any problem
+    the input path is returned unchanged so the upload proceeds with
+    the original file.
+    """
+    if path.suffix.lower() not in VIDEO_EXTENSIONS:
         return path
 
     if not shutil.which("ffmpeg"):
         log(f"[opt] FFmpeg not found; leaving {path.name} unchanged")
         return path
 
-    optimized = path.with_name(f"{path.stem}.faststart{path.suffix}")
-    command = [
-        "ffmpeg", "-y", "-nostdin",
-        "-i", str(path),
-        "-c", "copy",
-        "-movflags", "+faststart",
-        "-loglevel", "error",
-        str(optimized),
-    ]
-    try:
-        log(f"[opt] Applying MP4 faststart to {path.name}")
-        subprocess.run(command, check=True, timeout=1800)
+    # The MP4 family keeps its name; every other container becomes
+    # .mp4 so Telegram always receives a real MP4 video.
+    is_mp4 = path.suffix.lower() in FASTSTART_EXTENSIONS
+    if is_mp4:
+        target = path
+    else:
+        target = path.with_suffix(".mp4")
+        counter = 1
+        while target.exists():
+            target = path.with_name(f"{path.stem}_{counter}.mp4")
+            counter += 1
 
-        if not optimized.exists() or optimized.stat().st_size == 0:
-            raise RuntimeError("FFmpeg produced no output")
+    # FFmpeg always writes a sibling temp file first, so a failed run
+    # can never destroy the downloaded original.
+    output = path.with_name(f"{path.stem}.opt.mp4")
 
-        optimized.replace(path)
-        log(
-            f"[opt] Faststart complete for {path.name} "
-            f"({format_size(path.stat().st_size)})"
-        )
-    except Exception as error:
-        log(f"[opt] Faststart failed for {path.name}: {error}")
-        optimized.unlink(missing_ok=True)
+    video_ok, audio_ok = probe_video_codecs(path)
+    attempts: list[tuple[str, list[str]]] = []
 
+    if video_ok and audio_ok:
+        # All codecs are Telegram-friendly: a pure remux suffices
+        # (faststart for MP4 sources, a container change otherwise).
+        attempts.append((
+            f"Repacking {path.name} with faststart" if is_mp4
+            else f"Converting {path.name} to MP4 (stream copy)",
+            ["-c", "copy", "-movflags", "+faststart"],
+        ))
+
+    if video_ok and not audio_ok:
+        # Video is fine, the audio is not (DTS, Opus, ...): keep the
+        # video stream and convert the audio only.
+        attempts.append((
+            f"Converting the audio of {path.name} to AAC",
+            ["-c:v", "copy", "-c:a", "aac", "-b:a", "160k",
+             "-movflags", "+faststart"],
+        ))
+
+    if not video_ok and VIDEO_REENCODE:
+        # Unsupported video codec (DivX, MPEG2, VP9, ...): a full
+        # re-encode also fixes the audio in the same pass.
+        attempts.append((
+            f"Re-encoding {path.name} to H.264/AAC (this is slow)",
+            ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+             "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart"],
+        ))
+
+    for what, codec_args in attempts:
+        # Subtitles and data streams cannot live in an MP4 and would
+        # abort the remux of typical MKVs, so they are dropped.
+        command = [
+            "ffmpeg", "-y", "-nostdin", "-i", str(path), *codec_args,
+            "-sn", "-dn", "-loglevel", "error", str(output),
+        ]
+        if _run_ffmpeg(command, what):
+            output.replace(target)
+            if target is not path:
+                path.unlink(missing_ok=True)
+            log(
+                f"[opt] {target.name} ready "
+                f"({format_size(target.stat().st_size)})"
+            )
+            return target
+
+    log(f"[opt] Leaving {path.name} unchanged")
     return path
 
 
@@ -2173,16 +2290,24 @@ async def worker() -> None:
                     path.unlink(missing_ok=True)
                     return
 
-                # Optimize videos for Telegram (MP4 faststart) before
-                # uploading; a no-op for other types or when FFmpeg is
-                # missing. The dedup hash was taken from the original
-                # download, so the registry keeps matching the source
-                # file (the name/size skip stays exact).
+                # Name and size of the original download go into the
+                # duplicate registry, so it keeps matching the source
+                # file even when the upload is converted (MKV to MP4).
+                original_name = path.name
                 original_size = path.stat().st_size
-                await asyncio.to_thread(optimize_video_faststart, path)
+
+                # Topic routing is keyed by the original download path;
+                # look the folder up before the video conversion can
+                # rename the file.
+                folder_name = file_folders.pop(str(path), None)
+
+                # Normalize videos for Telegram (MP4 with faststart);
+                # a no-op for other file types or without FFmpeg.
+                upload_path = await asyncio.to_thread(
+                    prepare_video_for_telegram, path
+                )
 
                 file_topic_id = topic_id
-                folder_name = file_folders.pop(str(path), None)
                 if auto_folder_topics and folder_name:
                     try:
                         file_topic_id = await get_or_create_folder_topic(
@@ -2194,11 +2319,13 @@ async def worker() -> None:
                             f"'{folder_name}': {exc}"
                         ) from exc
 
-                if await upload_one(path, file_topic_id):
+                if await upload_one(upload_path, file_topic_id):
                     file_count += 1
-                    mark_seen(hash_value, path.name, original_size, job_id)
-                    path.unlink(missing_ok=True)
-                    log(f"[worker] Job #{job_id}: uploaded {path.name}")
+                    mark_seen(
+                        hash_value, original_name, original_size, job_id
+                    )
+                    upload_path.unlink(missing_ok=True)
+                    log(f"[worker] Job #{job_id}: uploaded {upload_path.name}")
                 else:
                     # Kept on the server: not sent, so it stays
                     # unrecorded in the duplicate registry and the same
@@ -2206,7 +2333,7 @@ async def worker() -> None:
                     # about again instead of being skipped.
                     kept_count += 1
                     log(
-                        f"[worker] Job #{job_id}: kept {path.name} "
+                        f"[worker] Job #{job_id}: kept {upload_path.name} "
                         "on the server"
                     )
 
