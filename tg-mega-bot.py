@@ -130,6 +130,10 @@ MEGA_FILE_DELAY = env_float("MEGA_FILE_DELAY", 0.25)
 MEGA_FAIL_STREAK = int(env_float("MEGA_FAIL_STREAK", 10))
 MEGA_COOLDOWN = env_float("MEGA_COOLDOWN", 300)
 
+# When a folder job aborts on API error -16, it is re-queued this
+# many times automatically, each run doubling the per-file pacing.
+MEGA_AUTO_RETRIES = int(env_float("MEGA_AUTO_RETRIES", 3))
+
 # Bytes fetched from the storage server per read (also the decrypt unit).
 DOWNLOAD_CHUNK = 1024 * 1024
 
@@ -257,7 +261,9 @@ def init_db() -> None:
                 status TEXT NOT NULL DEFAULT 'pending',
                 error TEXT,
                 auto_folder_topics INTEGER NOT NULL DEFAULT 0,
-                force_dupes INTEGER NOT NULL DEFAULT 0
+                force_dupes INTEGER NOT NULL DEFAULT 0,
+                file_delay REAL NOT NULL DEFAULT 0,
+                retry_attempt INTEGER NOT NULL DEFAULT 0
             )
         """)
 
@@ -273,6 +279,16 @@ def init_db() -> None:
         if "force_dupes" not in columns:
             db.execute(
                 "ALTER TABLE jobs ADD COLUMN force_dupes "
+                "INTEGER NOT NULL DEFAULT 0"
+            )
+        if "file_delay" not in columns:
+            db.execute(
+                "ALTER TABLE jobs ADD COLUMN file_delay "
+                "REAL NOT NULL DEFAULT 0"
+            )
+        if "retry_attempt" not in columns:
+            db.execute(
+                "ALTER TABLE jobs ADD COLUMN retry_attempt "
                 "INTEGER NOT NULL DEFAULT 0"
             )
 
@@ -319,36 +335,46 @@ def add_jobs(
     requester: int,
     auto_folder_topics: bool = False,
     force_dupes: bool = False,
-) -> None:
-    """Add new jobs to the persistent queue."""
+    file_delay: float = 0.0,
+    retry_attempt: int = 0,
+) -> list[int]:
+    """Add new jobs to the persistent queue; return their job IDs."""
     with closing(db_connect()) as db, db:
-        db.executemany(
-            """
-            INSERT INTO jobs (
-                link, topic_id, requester, status, auto_folder_topics,
-                force_dupes
-            )
-            VALUES (?, ?, ?, 'pending', ?, ?)
-            """,
-            [
+        ids: list[int] = []
+
+        for link in links:
+            cursor = db.execute(
+                """
+                INSERT INTO jobs (
+                    link, topic_id, requester, status, auto_folder_topics,
+                    force_dupes, file_delay, retry_attempt
+                )
+                VALUES (?, ?, ?, 'pending', ?, ?, ?, ?)
+                """,
                 (
                     link,
                     topic_id,
                     requester,
                     int(auto_folder_topics),
                     int(force_dupes),
-                )
-                for link in links
-            ],
-        )
+                    float(file_delay),
+                    int(retry_attempt),
+                ),
+            )
+            ids.append(int(cursor.lastrowid))
+
+        return ids
 
 
-def claim_job() -> tuple[int, str, int | None, bool, bool] | None:
+def claim_job() -> (
+    tuple[int, str, int | None, int, bool, bool, float, int] | None
+):
     """Get the oldest pending job and mark it as running."""
     with closing(db_connect()) as db, db:
         row = db.execute(
             """
-            SELECT id, link, topic_id, auto_folder_topics, force_dupes
+            SELECT id, link, topic_id, requester, auto_folder_topics,
+                   force_dupes, file_delay, retry_attempt
             FROM jobs
             WHERE status = 'pending'
             ORDER BY id
@@ -363,7 +389,16 @@ def claim_job() -> tuple[int, str, int | None, bool, bool] | None:
             "UPDATE jobs SET status = 'running' WHERE id = ?",
             (row[0],),
         )
-        return (row[0], row[1], row[2], bool(row[3]), bool(row[4]))
+        return (
+            row[0],
+            row[1],
+            row[2],
+            row[3],
+            bool(row[4]),
+            bool(row[5]),
+            float(row[6] or 0.0),
+            int(row[7] or 0),
+        )
 
 
 def finish_job(job_id: int, error: str | None = None) -> None:
@@ -786,6 +821,15 @@ class MegaApiError(RuntimeError):
         )
 
 
+class MegaThrottled(MegaApiError):
+    """MEGA answered -16: the share handle expired or, far more
+    commonly, MEGA is rate limiting API access to the share."""
+
+
+class MegaJobAborted(RuntimeError):
+    """A folder job gave up because MEGA kept answering -16."""
+
+
 class MegaBandwidthLimit(RuntimeError):
     """The storage server refused the download (HTTP 509)."""
 
@@ -897,6 +941,11 @@ def mega_api(body: list, handle: str | None = None) -> dict:
                     )
                     time.sleep(delay)
                     continue
+
+                if first == -16:
+                    # Report -16 distinctly so the download loop can
+                    # back off and stop instead of hammering the API.
+                    raise MegaThrottled(first)
 
                 raise MegaApiError(first)
 
@@ -1277,6 +1326,7 @@ async def iter_download(
     stats: dict | None = None,
     file_folders: dict[str, str | None] | None = None,
     force_dupes: bool = False,
+    file_delay: float = 0.0,
 ):
     """Download a MEGA link file by file, yielding each file as it arrives.
 
@@ -1291,6 +1341,8 @@ async def iter_download(
     original folder path for per-folder topic routing in the worker.
     With force_dupes set, the duplicate checks are bypassed so files
     already uploaded in earlier jobs are downloaded and sent again.
+    file_delay overrides the per-file pacing; the automatic re-queue
+    after an API error -16 abort uses it to slow down each attempt.
     """
     if RUNNING["cancel"]:
         raise JobCancelled()
@@ -1315,6 +1367,9 @@ async def iter_download(
     total = len(entries)
     failed = 0
     fail_streak = 0
+    throttle_streak = 0
+    throttle_cooldowns = 0
+    pace_delay = file_delay if file_delay > 0 else MEGA_FILE_DELAY
 
     for index, entry in enumerate(entries, start=1):
         if RUNNING["cancel"]:
@@ -1334,8 +1389,10 @@ async def iter_download(
             continue
 
         # Gentle pacing so huge shares do not trip MEGA rate limits.
-        if MEGA_FILE_DELAY > 0:
-            await asyncio.sleep(MEGA_FILE_DELAY)
+        # After a -16 the delay doubles per failure (capped), so a
+        # throttled share is polled ever more slowly.
+        if pace_delay > 0:
+            await asyncio.sleep(pace_delay)
 
         size_text = f" ({format_size(size)})" if size else ""
         log(f"[dl] ({index}/{total}) Downloading {name}{size_text}")
@@ -1348,15 +1405,70 @@ async def iter_download(
             path = await download_mega_file(folder_handle, entry, sub_dir)
         except JobCancelled:
             raise
+        except MegaThrottled as exc:
+            # MEGA answered -16. Skipping to the next file only hammers
+            # the API with the same request, so slow down, probe the
+            # share and stop the job when the throttle does not lift.
+            failed += 1
+            fail_streak += 1
+            throttle_streak += 1
+            pace_delay = min(10.0, max(pace_delay * 2, 1.0))
+            log(f"[dl] Download failed for {name}: {exc}")
+
+            if throttle_streak < MEGA_FAIL_STREAK:
+                continue
+
+            # Is the share still listable at all, or is API access to
+            # it throttled as a whole?
+            log(
+                f"[dl] {throttle_streak} downloads failed with -16 in "
+                "a row; probing the share handle"
+            )
+            try:
+                await asyncio.to_thread(
+                    request_folder_nodes, folder_handle
+                )
+            except Exception as probe_exc:
+                raise MegaJobAborted(
+                    "MEGA keeps answering -16 for this share and the "
+                    f"share handle no longer lists ({probe_exc}). "
+                    "Stopping the job instead of hammering the API."
+                ) from None
+
+            if MEGA_COOLDOWN <= 0 or throttle_cooldowns >= 2:
+                raise MegaJobAborted(
+                    "MEGA keeps answering -16 for this share even "
+                    "though it still lists. Stopping the job after "
+                    f"{throttle_cooldowns} cooldown(s)."
+                ) from None
+
+            throttle_cooldowns += 1
+            log(
+                f"[dl] Share still lists; cooling down for "
+                f"{int(MEGA_COOLDOWN)}s before continuing "
+                f"(cooldown {throttle_cooldowns}/2)"
+            )
+            waited = 0.0
+            while waited < MEGA_COOLDOWN:
+                if RUNNING["cancel"]:
+                    raise JobCancelled()
+
+                step = min(1.0, MEGA_COOLDOWN - waited)
+                await asyncio.sleep(step)
+                waited += step
+
+            fail_streak = 0
+            throttle_streak = 0
+            continue
         except Exception as exc:
             # One broken file should not kill the whole folder job.
             failed += 1
             fail_streak += 1
             log(f"[dl] Download failed for {name}: {exc}")
 
-            # A run of consecutive failures means MEGA is rate limiting
-            # or has expired the share handle; pushing on would only
-            # hammer the API harder, so pause and cool down instead.
+            # A run of consecutive failures means MEGA is having
+            # trouble; pushing on would only hammer the API harder,
+            # so pause and cool down instead.
             if fail_streak >= MEGA_FAIL_STREAK and MEGA_COOLDOWN > 0:
                 log(
                     f"[dl] {fail_streak} downloads failed in a row; "
@@ -1377,6 +1489,8 @@ async def iter_download(
             continue
 
         fail_streak = 0
+        throttle_streak = 0
+        pace_delay = MEGA_FILE_DELAY
 
         if file_folders is not None:
             file_folders[str(path)] = mega_folder_for_file(name)
@@ -1968,7 +2082,16 @@ async def worker() -> None:
             await asyncio.sleep(2)
             continue
 
-        job_id, link, topic_id, auto_folder_topics, force_dupes = job
+        (
+            job_id,
+            link,
+            topic_id,
+            requester,
+            auto_folder_topics,
+            force_dupes,
+            file_delay,
+            retry_attempt,
+        ) = job
         RUNNING.update(job_id=job_id, process=None, cancel=False)
         log(
             f"[worker] Claimed job #{job_id} "
@@ -2070,6 +2193,7 @@ async def worker() -> None:
                         stats,
                         file_folders,
                         force_dupes,
+                        file_delay,
                     ):
                         await handle_downloaded(path)
 
@@ -2108,6 +2232,51 @@ async def worker() -> None:
             await notify(f"Job #{job_id} cancelled.", topic_id)
 
             # Keep the cancellation message visible.
+            asyncio.create_task(delete_status([start_message], 0))
+
+        except MegaJobAborted as exc:
+            finish_job(job_id, error=str(exc))
+            log(f"[worker] Job #{job_id} aborted: {exc}")
+
+            base_delay = file_delay if file_delay > 0 else MEGA_FILE_DELAY
+
+            if retry_attempt >= MEGA_AUTO_RETRIES:
+                log(
+                    f"[worker] Job #{job_id}: automatic retry limit "
+                    f"({MEGA_AUTO_RETRIES}) reached"
+                )
+                await notify(
+                    f"Job #{job_id} aborted: {str(exc).rstrip('.')} "
+                    f"No automatic retry is left (limit "
+                    f"{MEGA_AUTO_RETRIES}); use /retry once MEGA "
+                    "accepts downloads from this share again.",
+                    topic_id,
+                )
+            else:
+                next_delay = base_delay * 2
+                new_id = add_jobs(
+                    [link],
+                    topic_id,
+                    requester,
+                    auto_folder_topics,
+                    force_dupes,
+                    file_delay=next_delay,
+                    retry_attempt=retry_attempt + 1,
+                )[0]
+                log(
+                    f"[worker] Job #{job_id} re-queued as job #{new_id} "
+                    f"with a {next_delay}s per-file delay (run "
+                    f"{retry_attempt + 2} of {MEGA_AUTO_RETRIES + 1})"
+                )
+                await notify(
+                    f"Job #{job_id} aborted by MEGA error -16. "
+                    f"Re-queued as job #{new_id} with a {next_delay}s "
+                    f"per-file delay (run {retry_attempt + 2} of "
+                    f"{MEGA_AUTO_RETRIES + 1}).",
+                    topic_id,
+                )
+
+            # Keep the error message visible, like other failures.
             asyncio.create_task(delete_status([start_message], 0))
 
         except Exception as exc:
