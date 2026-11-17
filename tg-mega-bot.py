@@ -2186,7 +2186,7 @@ VIDEO_EXTENSIONS = {
     ".mp4", ".m4v", ".mov", ".mkv", ".avi", ".webm", ".wmv", ".flv",
     ".mpg", ".mpeg", ".ts", ".m2ts", ".3gp", ".ogv", ".vob",
 }
-FASTSTART_EXTENSIONS = {".mp4", ".m4v", ".mov"}
+FASTSTART_EXTENSIONS = {".mp4"}
 VIDEO_REENCODE = (
     os.environ.get("VIDEO_REENCODE", "1").strip().lower()
     not in ("0", "false", "no")
