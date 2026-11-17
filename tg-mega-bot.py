@@ -144,7 +144,7 @@ DOWNLOAD_CHUNK = 1024 * 1024
 MEGA_REGEX = re.compile(
     r"https?://mega\.(?:nz|io)/"
     r"(?:(?:file|folder)/[\w-]+#[\w-]+(?:/(?:folder|file)/[\w-]+)*"
-    r"|#F?![\w-]+![\w-]+)"
+    r"|#![\w-]+![\w-]+)"
 )
 
 # A new-style link may select a subfolder or a single file inside the
@@ -971,12 +971,14 @@ def request_folder_nodes(handle: str) -> list[dict]:
     )
 
 
-def list_public_folder(link: str) -> list[tuple[str, str, int, bytes]]:
+def list_public_folder(
+    link: str,
+) -> list[tuple[str, str, int, bytes, str | None]]:
     """Turn a public folder link into downloadable file entries.
 
-    Returns (path name, node handle, size, key material) tuples. A link
-    ending in a subfolder or file path limits the result to that
-    subtree of the share.
+    Returns (path name, node handle, size, key material, topic folder)
+    tuples. A link ending in a subfolder or file path limits the
+    result to that subtree of the share.
     """
     match = re.search(r"/folder/([\w-]+)#([\w-]+)", link)
     if not match:
@@ -1014,6 +1016,12 @@ def list_public_folder(link: str) -> list[tuple[str, str, int, bytes]]:
             parts.append(name)
         return "/".join(reversed(parts))
 
+    # Path of a selected subfolder link; topic names are computed
+    # relative to this selection instead of the share root.
+    selected_folder_path = ""
+    if sub_handle and by_handle[sub_handle].get("t") == 1:
+        selected_folder_path = folder_path(by_handle[sub_handle])
+
     # Restrict the download to the selected subtree: the target node
     # itself and everything below it.
     allowed: set[str] | None = None
@@ -1034,7 +1042,7 @@ def list_public_folder(link: str) -> list[tuple[str, str, int, bytes]]:
         target = decrypted.get(sub_handle, (None, None))[1] or sub_handle
         log(f"[dl] Link selects '{target}'; downloading only that subtree")
 
-    entries: list[tuple[str, str, int, bytes]] = []
+    entries: list[tuple[str, str, int, bytes, str | None]] = []
     for node in nodes:
         # Only real files with content are queued (t=0, size > 0).
         if node.get("t") != 0 or not node.get("s"):
@@ -1048,7 +1056,26 @@ def list_public_folder(link: str) -> list[tuple[str, str, int, bytes]]:
         material, name = result
         path = folder_path(node)
         label = f"{path}/{name}" if path else (name or node["h"])
-        entries.append((label, node["h"], node["s"], material))
+        # With a subfolder selected, the topic name comes from the
+        # folder directly below that selection; deeper levels stay in
+        # the same topic and files directly in the selection get none.
+        # Without a selection, the first folder below the share root
+        # routes the file.
+        topic_folder = None
+        if sub_handle and by_handle[sub_handle].get("t") == 1:
+            if node.get("h") != sub_handle and name:
+                full_parts = [part for part in label.split("/") if part]
+                selected_parts = [
+                    part for part in selected_folder_path.split("/") if part
+                ]
+                relative_parts = full_parts[len(selected_parts):]
+                if len(relative_parts) > 1:
+                    topic_folder = relative_parts[0]
+        else:
+            topic_folder = mega_folder_for_file(label)
+        entries.append(
+            (label, node["h"], node["s"], material, topic_folder)
+        )
     entries.sort(key=lambda entry: entry[0])
     if sub_handle and not entries:
         raise RuntimeError("Selected subfolder contains no downloadable files")
@@ -1058,11 +1085,11 @@ def list_public_folder(link: str) -> list[tuple[str, str, int, bytes]]:
 async def list_mega_files(link: str):
     """List the individual files contained in a MEGA folder link.
 
-    Returns (name, node handle, size, key material) tuples, or None
-    when listing is not possible, in which case the caller falls back
-    to one bulk download of the whole link. Links that select a
-    subfolder or file never fall back: downloading the entire share
-    would be the opposite of what was asked for.
+    Returns (name, node handle, size, key material, topic folder)
+    tuples, or None when listing is not possible, in which case the
+    caller falls back to one bulk download of the whole link. Links
+    that select a subfolder or file never fall back: downloading the
+    entire share would be the opposite of what was asked for.
     """
     if link_kind(link) == "file":
         return None
@@ -1079,7 +1106,7 @@ async def list_mega_files(link: str):
             raise
         log(f"[dl] Listing failed, falling back to bulk download: {exc}")
         return None
-    total_size = sum(size for _, _, size, _ in entries)
+    total_size = sum(entry[2] for entry in entries)
     log(
         f"[dl] Folder contains {len(entries)} file(s), "
         f"{format_size(total_size)}"
@@ -1277,11 +1304,11 @@ def download_file_blocking(
 
 async def download_mega_file(
     folder_handle: str,
-    entry: tuple[str, str, int, bytes],
+    entry: tuple[str, str, int, bytes, str | None],
     dest_dir: Path,
 ) -> Path:
     """Download one folder file into dest_dir and return its path."""
-    name, handle, size, material = entry
+    name, handle, size, material = entry[:4]
     key = unmerge_key_mac(material)
     nonce = material[16:24] if len(material) == 32 else bytes(8)
     expected_mac = material[24:32] if len(material) == 32 else None
@@ -1375,7 +1402,7 @@ async def iter_download(
         if RUNNING["cancel"]:
             raise JobCancelled()
 
-        name, _, size, _ = entry
+        name, _, size, _ = entry[:4]
 
         # Skip files whose name and size match an upload the database
         # already knows, before spending any download bandwidth. The
@@ -1493,7 +1520,9 @@ async def iter_download(
         pace_delay = MEGA_FILE_DELAY
 
         if file_folders is not None:
-            file_folders[str(path)] = mega_folder_for_file(name)
+            file_folders[str(path)] = (
+                entry[4] if len(entry) > 4 else mega_folder_for_file(name)
+            )
 
         yield path
 
@@ -1554,12 +1583,12 @@ async def send_file(path: Path, topic_id: int | None, progress=None) -> None:
 # upload. For every such file the user now gets a one-time question:
 #
 #   Try unsplit     - one upload attempt as a single document. Telegram
-#                     rejects files beyond its own upload limit (about
-#                     2 GB for this bot account); the bot then falls
-#                     back to splitting automatically.
+#                    rejects files beyond its own upload limit (about
+#                    2 GB for this bot account); the bot then falls
+#                    back to splitting automatically.
 #   Split (N)       - the previous behaviour: N parts of PART_SIZE.
 #   Keep on server  - the unsplit file is moved into KEPT_DIR on the
-#                     data volume and nothing is uploaded.
+#                    data volume and nothing is uploaded.
 #
 # Not answering within LARGE_FILE_ASK_TIMEOUT seconds splits the file,
 # so an unattended queue keeps working as before.
