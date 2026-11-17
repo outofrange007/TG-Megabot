@@ -16,7 +16,10 @@ from contextlib import closing
 from pathlib import Path
 
 from telethon import TelegramClient, events, Button
-from telethon.tl.functions.messages import CreateForumTopicRequest
+from telethon.tl.functions.messages import (
+    CreateForumTopicRequest,
+    GetForumTopicsRequest,
+)
 # Deleting a forum topic is done with messages.deleteTopicHistory, where
 # top_msg_id is the topic ID (the message ID of the topic's root service
 # message). Some Telethon generations expose the same request in the
@@ -193,6 +196,10 @@ GAP = rf"[{INVISIBLE}\s]*"
 TOPIC_ICON_COLORS = [
     0x6FB9F0, 0xFFD67E, 0xCB86DB, 0x8EEE98, 0xFF93B2, 0xFB6F5F,
 ]
+
+# Maximum number of existing forum topics fetched when checking for a
+# duplicate topic name before creating a new one (10 pages of 100).
+TOPIC_LOOKUP_LIMIT = 1000
 
 client = TelegramClient(SESSION_PATH, API_ID, API_HASH)
 
@@ -1965,7 +1972,11 @@ async def get_or_create_folder_topic(
     folder_name: str,
     topic_cache: dict[str, int],
 ) -> int:
-    """Return the cached topic ID or create one for this MEGA folder."""
+    """Return the cached topic ID or create one for this MEGA folder.
+
+    Topics that already exist in the group under the same name
+    (case-insensitive) are reused instead of duplicated.
+    """
     if folder_name in topic_cache:
         return topic_cache[folder_name]
 
@@ -1973,10 +1984,8 @@ async def get_or_create_folder_topic(
     if not title:
         raise RuntimeError("MEGA folder name is empty; cannot create topic")
 
-    topic_id = await create_topic(title)
-    save_topic(topic_id, title)
+    topic_id, _created = await get_or_create_topic(title)
     topic_cache[folder_name] = topic_id
-    log(f"[topic] Created topic '{title}' (ID: {topic_id})")
     return topic_id
 
 
@@ -2002,13 +2011,105 @@ async def create_topic(name: str) -> int:
     raise RuntimeError("Topic created, but its ID could not be determined.")
 
 
+async def find_existing_topic(title: str) -> int | None:
+    """Return the topic ID of an existing forum topic with this name.
+
+    The Telegram group itself is queried (not the local registry), so
+    topics that were created manually or outside this bot are found as
+    well. The comparison is case-insensitive and ignores surrounding
+    whitespace. Returns None when no topic matches or the lookup
+    fails, so a broken lookup never blocks topic creation.
+    """
+    wanted = title.strip().casefold()
+    if not wanted:
+        return None
+
+    peer = await client.get_input_entity(CHAT_ID)
+    offset_date = 0
+    offset_id = 0
+    offset_topic_id = 0
+    fetched = 0
+
+    while fetched < TOPIC_LOOKUP_LIMIT:
+        try:
+            result = await client(
+                GetForumTopicsRequest(
+                    peer=peer,
+                    offset_date=offset_date,
+                    offset_id=offset_id,
+                    offset_topic_id=offset_topic_id,
+                    limit=100,
+                )
+            )
+        except Exception as exc:
+            log(f"[topic] Topic lookup failed: {exc}")
+            return None
+
+        topics = list(getattr(result, "topics", []) or [])
+        if not topics:
+            break
+
+        # Each topic's root service message comes with the response;
+        # its date feeds the pagination offset of the next page.
+        root_messages = {
+            message.id: message
+            for message in getattr(result, "messages", []) or []
+        }
+
+        for topic in topics:
+            topic_title = getattr(topic, "title", "") or ""
+            if topic_title.strip().casefold() == wanted:
+                topic_id = getattr(topic, "id", None)
+                if topic_id:
+                    return topic_id
+
+        fetched += len(topics)
+
+        if len(topics) < 100:
+            break
+
+        # Continue with the page after the last returned topic.
+        last = topics[-1]
+        offset_topic_id = getattr(last, "id", 0) or 0
+        offset_id = offset_topic_id
+        root_message = root_messages.get(offset_topic_id)
+        if root_message is not None and getattr(root_message, "date", None):
+            offset_date = int(root_message.date.timestamp())
+
+    return None
+
+
+async def get_or_create_topic(name: str) -> tuple[int, bool]:
+    """Return the topic ID for name, reusing an existing topic.
+
+    Returns (topic_id, created). created is False when a topic with
+    the same name (case-insensitive) already exists in the group; that
+    topic is then reused instead of creating a duplicate.
+    """
+    existing_id = await find_existing_topic(name)
+
+    if existing_id is not None:
+        log(
+            f"[topic] Topic '{name}' already exists "
+            f"(ID: {existing_id}); reusing it"
+        )
+        save_topic(existing_id, name)
+        return existing_id, False
+
+    topic_id = await create_topic(name)
+    save_topic(topic_id, name)
+    return topic_id, True
+
+
 async def resolve_target_topic(
     event, text: str, usage: str
 ) -> tuple[int | None, str | None]:
     """Resolve the target topic of a queued-link command.
 
     -newtopic wins over -t, which wins over replying inside a topic.
-    Returns (topic_id, error_text); exactly one of the two is None.
+    A -newtopic name that already exists as a topic is reused instead
+    of creating a duplicate. Returns (topic_id, error_text); exactly
+    one of the two is None.
     """
     newtopic_match = NEWTOPIC_REGEX.search(text)
     topic_match = TOPIC_REGEX.search(text)
@@ -2019,7 +2120,7 @@ async def resolve_target_topic(
             return None, usage
 
         try:
-            topic_id = await create_topic(new_name)
+            topic_id, _created = await get_or_create_topic(new_name)
         except Exception as exc:
             error = str(exc) or type(exc).__name__
             print(f"Topic creation failed: {error}", flush=True)
@@ -2031,7 +2132,6 @@ async def resolve_target_topic(
 
             return None, reply
 
-        save_topic(topic_id, new_name)
         return topic_id, None
 
     if topic_match:
@@ -2527,7 +2627,7 @@ async def on_mega(event) -> None:
 
 @client.on(events.NewMessage(pattern=rf"^{GAP}/yt(?:@\w+)?{GAP}(?:\s|$)"))
 async def on_yt(event) -> None:
-    """/yt <url(s)> [-t topic_id] [-newtopic <name>] - queue YouTube videos."""
+    """/yt <url(s)> [-t <topic_id>] [-newtopic <name>] - queue YouTube videos."""
     if not is_allowed(event):
         return
 
@@ -2562,7 +2662,7 @@ async def on_yt(event) -> None:
 
 @client.on(events.NewMessage(pattern=rf"^{GAP}/nk(?:@\w+)?{GAP}(?:\s|$)"))
 async def on_nk(event) -> None:
-    """/nk <url(s)> [-t topic_id] [-newtopic <name>] - queue Netzkino movies."""
+    """/nk <url(s)> [-t <topic_id>] [-newtopic <name>] - queue Netzkino movies."""
     if not is_allowed(event):
         return
 
@@ -2790,7 +2890,7 @@ async def on_newtopic(event) -> None:
     name = clamp_topic_name(name)
 
     try:
-        topic_id = await create_topic(name)
+        topic_id, created = await get_or_create_topic(name)
     except Exception as exc:
         error = str(exc) or type(exc).__name__
         print(f"Topic creation failed: {error}", flush=True)
@@ -2803,8 +2903,12 @@ async def on_newtopic(event) -> None:
         await event.reply(reply)
         return
 
-    save_topic(topic_id, name)
-    await event.reply(f"Created topic '{name}' (ID: {topic_id}).")
+    if created:
+        await event.reply(f"Created topic '{name}' (ID: {topic_id}).")
+    else:
+        await event.reply(
+            f"Topic '{name}' already exists (ID: {topic_id}); using it."
+        )
 
 
 @client.on(events.NewMessage(pattern=rf"^{GAP}/topics(?:@\w+)?{GAP}$"))
