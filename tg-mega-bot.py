@@ -1016,11 +1016,26 @@ def list_public_folder(
             parts.append(name)
         return "/".join(reversed(parts))
 
-    # Path of a selected subfolder link; topic names are computed
-    # relative to this selection instead of the share root.
+    # Full path of the subfolder selected by the link, INCLUDING its
+    # own name. folder_path() only builds containing paths (it stops
+    # at the node's parent), so the selected folder's own name has to
+    # be appended here. Without it, topic routing started at the
+    # selection itself and every topic was named after the selected
+    # folder instead of its children. If the share root itself is
+    # selected, the path stays empty and the first folder level below
+    # the root routes the topics.
     selected_folder_path = ""
     if sub_handle and by_handle[sub_handle].get("t") == 1:
-        selected_folder_path = folder_path(by_handle[sub_handle])
+        selected_node = by_handle[sub_handle]
+        if selected_node["h"] not in root_handles:
+            own_name = decrypted.get(sub_handle, (None, None))[1]
+            parent_path = folder_path(selected_node)
+            if own_name:
+                selected_folder_path = (
+                    f"{parent_path}/{own_name}" if parent_path else own_name
+                )
+            else:
+                selected_folder_path = parent_path
 
     # Restrict the download to the selected subtree: the target node
     # itself and everything below it.
