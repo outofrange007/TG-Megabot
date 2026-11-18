@@ -137,6 +137,12 @@ MEGA_COOLDOWN = env_float("MEGA_COOLDOWN", 300)
 # many times automatically, each run doubling the per-file pacing.
 MEGA_AUTO_RETRIES = int(env_float("MEGA_AUTO_RETRIES", 3))
 
+# When a folder job pauses on HTTP 509 (MEGA bandwidth limit), it is
+# re-queued to start again after this many seconds; every further 509
+# pause doubles the wait. The pause exists so the quota can reset
+# instead of the bot burning failed retries file by file.
+BANDWIDTH_REQUEUE_DELAY = env_float("BANDWIDTH_REQUEUE_DELAY", 900)
+
 # Bytes fetched from the storage server per read (also the decrypt unit).
 DOWNLOAD_CHUNK = 1024 * 1024
 
@@ -233,6 +239,12 @@ def clean_urls(raw_urls: list[str]) -> list[str]:
 # locking is needed.
 RUNNING = {"job_id": None, "process": None, "cancel": False}
 
+# Live progress of the running folder job, keyed by job ID and read
+# by /queue. iter_download writes the position inside the folder
+# listing, the worker writes the upload/skip counters. The entry is
+# removed when the job ends, so /queue can tell running from idle.
+JOB_PROGRESS: dict[int, dict] = {}
+
 
 class JobCancelled(Exception):
     """Raised when the user cancels the currently running job."""
@@ -270,7 +282,8 @@ def init_db() -> None:
                 auto_folder_topics INTEGER NOT NULL DEFAULT 0,
                 force_dupes INTEGER NOT NULL DEFAULT 0,
                 file_delay REAL NOT NULL DEFAULT 0,
-                retry_attempt INTEGER NOT NULL DEFAULT 0
+                retry_attempt INTEGER NOT NULL DEFAULT 0,
+                not_before REAL
             )
         """)
 
@@ -298,6 +311,8 @@ def init_db() -> None:
                 "ALTER TABLE jobs ADD COLUMN retry_attempt "
                 "INTEGER NOT NULL DEFAULT 0"
             )
+        if "not_before" not in columns:
+            db.execute("ALTER TABLE jobs ADD COLUMN not_before REAL")
 
         # Registry of forum topics the bot created or saw being created.
         db.execute("""
@@ -358,8 +373,13 @@ def add_jobs(
     force_dupes: bool = False,
     file_delay: float = 0.0,
     retry_attempt: int = 0,
+    not_before: float | None = None,
 ) -> list[int]:
-    """Add new jobs to the persistent queue; return their job IDs."""
+    """Add new jobs to the persistent queue; return their job IDs.
+
+    not_before is an epoch timestamp: the job is not claimed before
+    that time (used to pause jobs after a MEGA bandwidth limit).
+    """
     with closing(db_connect()) as db, db:
         ids: list[int] = []
 
@@ -368,9 +388,9 @@ def add_jobs(
                 """
                 INSERT INTO jobs (
                     link, topic_id, requester, status, auto_folder_topics,
-                    force_dupes, file_delay, retry_attempt
+                    force_dupes, file_delay, retry_attempt, not_before
                 )
-                VALUES (?, ?, ?, 'pending', ?, ?, ?, ?)
+                VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?)
                 """,
                 (
                     link,
@@ -380,6 +400,7 @@ def add_jobs(
                     int(force_dupes),
                     float(file_delay),
                     int(retry_attempt),
+                    not_before,
                 ),
             )
             ids.append(int(cursor.lastrowid))
@@ -390,7 +411,11 @@ def add_jobs(
 def claim_job() -> (
     tuple[int, str, int | None, int, bool, bool, float, int] | None
 ):
-    """Get the oldest pending job and mark it as running."""
+    """Get the oldest claimable pending job and mark it as running.
+
+    Jobs with a not_before timestamp in the future (paused after a
+    bandwidth limit) are skipped until their wait has passed.
+    """
     with closing(db_connect()) as db, db:
         row = db.execute(
             """
@@ -398,9 +423,11 @@ def claim_job() -> (
                    force_dupes, file_delay, retry_attempt
             FROM jobs
             WHERE status = 'pending'
+              AND (not_before IS NULL OR not_before <= ?)
             ORDER BY id
             LIMIT 1
-            """
+            """,
+            (time.time(),),
         ).fetchone()
 
         if row is None:
@@ -450,6 +477,21 @@ def queue_status() -> tuple[int | None, int]:
         ).fetchone()[0]
 
     return (running[0] if running else None, pending)
+
+
+def pending_jobs(limit: int = 10) -> list[tuple[int, str, float | None]]:
+    """Return the next pending jobs as (id, link, not_before) tuples."""
+    with closing(db_connect()) as db:
+        return db.execute(
+            """
+            SELECT id, link, not_before
+            FROM jobs
+            WHERE status = 'pending'
+            ORDER BY id
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
 
 
 def retry_jobs(job_id: int | None = None) -> int:
@@ -1427,6 +1469,9 @@ async def iter_download(
     already uploaded in earlier jobs are downloaded and sent again.
     file_delay overrides the per-file pacing; the automatic re-queue
     after an API error -16 abort uses it to slow down each attempt.
+    A MegaBandwidthLimit (HTTP 509) is never treated as a single-file
+    failure: the whole job aborts and is re-queued with a wait, so
+    already uploaded files stay recorded and are skipped on resume.
     """
     if RUNNING["cancel"]:
         raise JobCancelled()
@@ -1454,6 +1499,8 @@ async def iter_download(
     throttle_streak = 0
     throttle_cooldowns = 0
     pace_delay = file_delay if file_delay > 0 else MEGA_FILE_DELAY
+    progress = JOB_PROGRESS.setdefault(job_id, {})
+    progress.update(total=total, current=0, current_name="")
 
     for index, entry in enumerate(entries, start=1):
         if RUNNING["cancel"]:
@@ -1468,6 +1515,7 @@ async def iter_download(
         if not force_dupes and stats is not None and size:
             if node_handle and seen_by_node(node_handle):
                 stats["skipped_pre"] = stats.get("skipped_pre", 0) + 1
+                progress["skipped"] = progress.get("skipped", 0) + 1
                 mark_skipped(Path(name).name, size, "node", job_id)
                 log(
                     f"[dl] ({index}/{total}) Skipping {name}: "
@@ -1477,6 +1525,7 @@ async def iter_download(
 
             if seen_by_name_size(Path(name).name, size):
                 stats["skipped_pre"] = stats.get("skipped_pre", 0) + 1
+                progress["skipped"] = progress.get("skipped", 0) + 1
                 mark_skipped(Path(name).name, size, "name/size", job_id)
                 log(
                     f"[dl] ({index}/{total}) Skipping {name}: "
@@ -1492,6 +1541,8 @@ async def iter_download(
 
         size_text = f" ({format_size(size)})" if size else ""
         log(f"[dl] ({index}/{total}) Downloading {name}{size_text}")
+        progress["current"] = index
+        progress["current_name"] = Path(name).name
 
         # Fresh subfolder per file so exactly one file accumulates.
         sub_dir = temp_dir / f"file{index:04d}"
@@ -1501,6 +1552,13 @@ async def iter_download(
             path = await download_mega_file(folder_handle, entry, sub_dir)
         except JobCancelled:
             raise
+        except MegaBandwidthLimit:
+            # MEGA's bandwidth quota (HTTP 509) is exhausted. Waiting
+            # 60s and moving on to the next file would fail the same
+            # way for every remaining file of the folder, so abort the
+            # whole job instead: the worker re-queues it with a wait
+            # long enough for the quota to reset.
+            raise
         except MegaThrottled as exc:
             # MEGA answered -16. Skipping to the next file only hammers
             # the API with the same request, so slow down, probe the
@@ -1508,6 +1566,7 @@ async def iter_download(
             failed += 1
             fail_streak += 1
             throttle_streak += 1
+            progress["failed"] = progress.get("failed", 0) + 1
             pace_delay = min(10.0, max(pace_delay * 2, 1.0))
             log(f"[dl] Download failed for {name}: {exc}")
 
@@ -1560,6 +1619,7 @@ async def iter_download(
             # One broken file should not kill the whole folder job.
             failed += 1
             fail_streak += 1
+            progress["failed"] = progress.get("failed", 0) + 1
             log(f"[dl] Download failed for {name}: {exc}")
 
             # A run of consecutive failures means MEGA is having
@@ -2404,6 +2464,15 @@ async def worker() -> None:
             retry_attempt,
         ) = job
         RUNNING.update(job_id=job_id, process=None, cancel=False)
+        JOB_PROGRESS[job_id] = {
+            "total": None,
+            "current": 0,
+            "current_name": "",
+            "uploaded": 0,
+            "kept": 0,
+            "skipped": 0,
+            "failed": 0,
+        }
         log(
             f"[worker] Claimed job #{job_id} "
             f"(topic: {topic_id or 'default'}): {link}"
@@ -2428,6 +2497,7 @@ async def worker() -> None:
                 # -dupes re-sends files the registry already knows.
                 if not force_dupes and seen_file(hash_value):
                     skipped_count += 1
+                    JOB_PROGRESS[job_id]["skipped"] += 1
                     mark_skipped(
                         path.name,
                         path.stat().st_size,
@@ -2473,6 +2543,7 @@ async def worker() -> None:
 
                 if await upload_one(upload_path, file_topic_id):
                     file_count += 1
+                    JOB_PROGRESS[job_id]["uploaded"] = file_count
                     mark_seen(
                         hash_value,
                         original_name,
@@ -2488,6 +2559,7 @@ async def worker() -> None:
                     # link queued again will be downloaded and asked
                     # about again instead of being skipped.
                     kept_count += 1
+                    JOB_PROGRESS[job_id]["kept"] = kept_count
                     log(
                         f"[worker] Job #{job_id}: kept {upload_path.name} "
                         "on the server"
@@ -2607,6 +2679,54 @@ async def worker() -> None:
             # Keep the error message visible, like other failures.
             asyncio.create_task(delete_status([start_message], 0))
 
+        except MegaBandwidthLimit as exc:
+            # MEGA's bandwidth quota for this IP is exhausted (HTTP
+            # 509). Continuing with the next file would fail the same
+            # way, so the job pauses and is re-queued with a wait that
+            # doubles per pause. Files already uploaded stay in the
+            # duplicate registry and are skipped when the job resumes.
+            finish_job(job_id, error=f"paused: {exc}")
+            log(f"[worker] Job #{job_id} paused: {exc}")
+
+            if retry_attempt >= MEGA_AUTO_RETRIES:
+                log(
+                    f"[worker] Job #{job_id}: 509 re-queue limit "
+                    f"({MEGA_AUTO_RETRIES}) reached"
+                )
+                await notify(
+                    f"Job #{job_id} paused ({exc}). No automatic "
+                    f"re-queue is left (limit {MEGA_AUTO_RETRIES}); "
+                    "use /retry once MEGA accepts downloads again.",
+                    topic_id,
+                )
+            else:
+                wait = BANDWIDTH_REQUEUE_DELAY * (2 ** retry_attempt)
+                new_id = add_jobs(
+                    [link],
+                    topic_id,
+                    requester,
+                    auto_folder_topics,
+                    force_dupes,
+                    file_delay=file_delay,
+                    retry_attempt=retry_attempt + 1,
+                    not_before=time.time() + wait,
+                )[0]
+                log(
+                    f"[worker] Job #{job_id} re-queued as job #{new_id} "
+                    f"after a bandwidth pause; it starts in about "
+                    f"{int(wait / 60)} min (run {retry_attempt + 2} "
+                    f"of {MEGA_AUTO_RETRIES + 1})"
+                )
+                await notify(
+                    f"Job #{job_id} paused ({exc}). Re-queued as job "
+                    f"#{new_id}; it starts in about {int(wait / 60)} "
+                    "minutes. Already sent files are skipped then.",
+                    topic_id,
+                )
+
+            # Keep the error message visible, like other failures.
+            asyncio.create_task(delete_status([start_message], 0))
+
         except Exception as exc:
             error = str(exc) or type(exc).__name__
             finish_job(job_id, error=error)
@@ -2619,6 +2739,7 @@ async def worker() -> None:
 
         finally:
             RUNNING.update(job_id=None, process=None, cancel=False)
+            JOB_PROGRESS.pop(job_id, None)
 
         _, pending = queue_status()
         log(f"[worker] Pending jobs: {pending}")
@@ -2754,16 +2875,71 @@ async def on_nk(event) -> None:
 
 @client.on(events.NewMessage(pattern=rf"^{GAP}/queue(?:@\w+)?{GAP}$"))
 async def on_queue(event) -> None:
-    """/queue - show the running job and number of pending jobs."""
+    """/queue - show running job progress and the pending jobs."""
     if not is_allowed(event):
         return
 
     running_id, pending = queue_status()
-    running_text = f"#{running_id}" if running_id is not None else "none"
+    parts = []
 
-    await event.reply(
-        f"Current job: {running_text}\nPending: {pending}"
-    )
+    if running_id is not None:
+        progress = JOB_PROGRESS.get(running_id, {})
+        total = progress.get("total")
+
+        if total:
+            current_line = (
+                f"Job #{running_id}: file "
+                f"{progress.get('current', 0)}/{total}"
+            )
+            if progress.get("current_name"):
+                current_line += f" — {progress['current_name']}"
+            parts.append(current_line)
+        else:
+            parts.append(f"Job #{running_id} is running.")
+
+        counts = []
+        if progress.get("uploaded"):
+            counts.append(f"{progress['uploaded']} sent")
+        if progress.get("skipped"):
+            counts.append(f"{progress['skipped']} duplicate(s) skipped")
+        if progress.get("kept"):
+            counts.append(f"{progress['kept']} kept on server")
+        if progress.get("failed"):
+            counts.append(f"{progress['failed']} failed")
+        if counts:
+            parts.append("So far: " + ", ".join(counts))
+    else:
+        parts.append("Current job: none")
+
+    jobs = pending_jobs()
+    if jobs:
+        lines = []
+        for job_id, job_link, not_before in jobs:
+            short = (
+                job_link if len(job_link) <= 60 else job_link[:57] + "..."
+            )
+            if not_before and not_before > time.time():
+                minutes = max(
+                    1, int(round((not_before - time.time()) / 60))
+                )
+                lines.append(
+                    f"#{job_id} — paused, starts in ~{minutes} min: "
+                    f"{short}"
+                )
+            else:
+                lines.append(f"#{job_id}: {short}")
+        parts.append(f"Pending ({pending}):\n" + "\n".join(lines))
+
+        if pending > len(jobs):
+            parts.append(f"...and {pending - len(jobs)} more.")
+    else:
+        parts.append("Pending: 0")
+
+    _, failed_total = list_failed(limit=1)
+    if failed_total:
+        parts.append(f"Failed: {failed_total} (re-queue with /retry)")
+
+    await event.reply("\n".join(parts))
 
 
 @client.on(events.NewMessage(pattern=rf"^{GAP}/dupes(?:@\w+)?{GAP}(?:\s{GAP}(reset))?{GAP}$"))
@@ -2832,7 +3008,7 @@ async def on_help(event) -> None:
         "queue MEGA links\n"
         "/yt <url(s)> [-t <topic_id>] [-newtopic <name>] - queue YouTube videos\n"
         "/nk <url(s)> [-t <topic_id>] [-newtopic <name>] - queue Netzkino movies\n"
-        "/queue - show the running job and pending count\n"
+        "/queue - show job progress and pending jobs\n"
         "/cancel [job_id] - cancel the running job or remove a pending one\n"
         "/failed - list recent failed jobs\n"
         "/retry [job_id] - re-queue failed jobs\n"
