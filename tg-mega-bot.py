@@ -3140,7 +3140,7 @@ async def main() -> None:
     init_db()
 
     known_count, _ = seen_stats()
-    total_skips, _, _ = skipped_stats()
+    total_skips = skipped_stats()[0]
 
     log(f"[bot] Chat ID: {CHAT_ID}")
     log(f"[bot] Allowed users: {', '.join(map(str, sorted(ALLOWED_USERS)))}")
