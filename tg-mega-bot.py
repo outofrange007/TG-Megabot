@@ -308,14 +308,28 @@ def init_db() -> None:
         """)
 
         # Content hashes of uploaded files, used to skip duplicates.
+        # node_handle is the file's own MEGA node ID, known before any
+        # download and stable across renames.
         db.execute("""
             CREATE TABLE IF NOT EXISTS seen_files (
                 hash TEXT PRIMARY KEY,
                 name TEXT NOT NULL,
                 size INTEGER NOT NULL,
-                job_id INTEGER
+                job_id INTEGER,
+                node_handle TEXT
             )
         """)
+
+        # Older databases lack the node_handle column.
+        seen_columns = {
+            row[1] for row in db.execute(
+                "PRAGMA table_info(seen_files)"
+            ).fetchall()
+        }
+        if "node_handle" not in seen_columns:
+            db.execute(
+                "ALTER TABLE seen_files ADD COLUMN node_handle TEXT"
+            )
 
         # History of duplicate-skip events: "name/size" for skips
         # before the download, "hash" for skips after it.
@@ -535,6 +549,22 @@ def seen_file(hash_value: str) -> bool:
         ).fetchone() is not None
 
 
+def seen_by_node(node_handle: str | None) -> bool:
+    """Return True when this exact MEGA file node was uploaded before.
+
+    The node handle comes from the folder listing, so it is known
+    before any download starts, and it survives renames.
+    """
+    if not node_handle:
+        return False
+
+    with closing(db_connect()) as db:
+        return db.execute(
+            "SELECT 1 FROM seen_files WHERE node_handle = ? LIMIT 1",
+            (node_handle,),
+        ).fetchone() is not None
+
+
 def seen_by_name_size(name: str, size: int) -> bool:
     """Return True when a file with this name and size was uploaded.
 
@@ -552,15 +582,17 @@ def mark_seen(
     name: str,
     size: int,
     job_id: int,
+    node_handle: str | None = None,
 ) -> None:
-    """Record an uploaded file's content hash."""
+    """Record an uploaded file's content hash and MEGA node handle."""
     with closing(db_connect()) as db, db:
         db.execute(
             """
-            INSERT OR IGNORE INTO seen_files (hash, name, size, job_id)
-            VALUES (?, ?, ?, ?)
+            INSERT OR IGNORE INTO seen_files
+                (hash, name, size, job_id, node_handle)
+            VALUES (?, ?, ?, ?, ?)
             """,
-            (hash_value, name, size, job_id),
+            (hash_value, name, size, job_id, node_handle),
         )
 
 
@@ -601,19 +633,20 @@ def mark_skipped(name: str, size: int, reason: str, job_id: int) -> None:
         )
 
 
-def skipped_stats() -> tuple[int, int, int]:
-    """Return the total, name/size and hash skip counts."""
+def skipped_stats() -> tuple[int, int, int, int]:
+    """Return the total, node, name/size and hash skip counts."""
     with closing(db_connect()) as db:
         row = db.execute(
             """
             SELECT COUNT(*),
+                   COALESCE(SUM(reason = 'node'), 0),
                    COALESCE(SUM(reason = 'name/size'), 0),
                    COALESCE(SUM(reason = 'hash'), 0)
             FROM skipped_files
             """
         ).fetchone()
 
-    return row[0], row[1], row[2]
+    return row[0], row[1], row[2], row[3]
 
 
 def recent_skipped(limit: int = 10) -> list[tuple[str, int, str, str]]:
@@ -1376,6 +1409,7 @@ async def iter_download(
     file_folders: dict[str, str | None] | None = None,
     force_dupes: bool = False,
     file_delay: float = 0.0,
+    file_handles: dict[str, str] | None = None,
 ):
     """Download a MEGA link file by file, yielding each file as it arrives.
 
@@ -1387,8 +1421,9 @@ async def iter_download(
     Single file links are handled by megadl directly. The optional
     stats dict collects files skipped before any download; job_id is
     stored with every recorded skip event. file_folders preserves the
-    original folder path for per-folder topic routing in the worker.
-    With force_dupes set, the duplicate checks are bypassed so files
+    original folder path for per-folder topic routing in the worker,
+    file_handles the MEGA node handle for the pre-download duplicate
+    check of later jobs. With force_dupes set, the duplicate checks are bypassed so files
     already uploaded in earlier jobs are downloaded and sent again.
     file_delay overrides the per-file pacing; the automatic re-queue
     after an API error -16 abort uses it to slow down each attempt.
@@ -1424,18 +1459,30 @@ async def iter_download(
         if RUNNING["cancel"]:
             raise JobCancelled()
 
-        name, _, size, _ = entry[:4]
+        name, node_handle, size, _ = entry[:4]
 
-        # Skip files whose name and size match an upload the database
-        # already knows, before spending any download bandwidth. The
-        # -dupes flag turns this off for the whole job.
-        if not force_dupes and stats is not None and size and (
-            seen_by_name_size(Path(name).name, size)
-        ):
-            stats["skipped_pre"] = stats.get("skipped_pre", 0) + 1
-            mark_skipped(Path(name).name, size, "name/size", job_id)
-            log(f"[dl] ({index}/{total}) Skipping {name}: already uploaded")
-            continue
+        # Skip known duplicates before spending any download bandwidth:
+        # first by the file's MEGA node handle (stable across renames),
+        # then by name and size from the folder listing. The -dupes
+        # flag turns this off for the whole job.
+        if not force_dupes and stats is not None and size:
+            if node_handle and seen_by_node(node_handle):
+                stats["skipped_pre"] = stats.get("skipped_pre", 0) + 1
+                mark_skipped(Path(name).name, size, "node", job_id)
+                log(
+                    f"[dl] ({index}/{total}) Skipping {name}: "
+                    "already uploaded (same file node)"
+                )
+                continue
+
+            if seen_by_name_size(Path(name).name, size):
+                stats["skipped_pre"] = stats.get("skipped_pre", 0) + 1
+                mark_skipped(Path(name).name, size, "name/size", job_id)
+                log(
+                    f"[dl] ({index}/{total}) Skipping {name}: "
+                    "already uploaded (same name and size)"
+                )
+                continue
 
         # Gentle pacing so huge shares do not trip MEGA rate limits.
         # After a -16 the delay doubles per failure (capped), so a
@@ -1545,6 +1592,9 @@ async def iter_download(
             file_folders[str(path)] = (
                 entry[4] if len(entry) > 4 else mega_folder_for_file(name)
             )
+
+        if file_handles is not None:
+            file_handles[str(path)] = node_handle
 
         yield path
 
@@ -2366,6 +2416,7 @@ async def worker() -> None:
             skipped_count = 0  # duplicates found after download
             stats = {"skipped_pre": 0}
             file_folders: dict[str, str | None] = {}
+            file_handles: dict[str, str] = {}
             folder_topics: dict[str, int] = {}
 
             async def handle_downloaded(path: Path) -> None:
@@ -2400,6 +2451,7 @@ async def worker() -> None:
                 # look the folder up before the video conversion can
                 # rename the file.
                 folder_name = file_folders.pop(str(path), None)
+                node_handle = file_handles.pop(str(path), None)
 
                 # Normalize videos for Telegram (MP4 with faststart);
                 # a no-op for other file types or without FFmpeg.
@@ -2422,7 +2474,11 @@ async def worker() -> None:
                 if await upload_one(upload_path, file_topic_id):
                     file_count += 1
                     mark_seen(
-                        hash_value, original_name, original_size, job_id
+                        hash_value,
+                        original_name,
+                        original_size,
+                        job_id,
+                        node_handle,
                     )
                     upload_path.unlink(missing_ok=True)
                     log(f"[worker] Job #{job_id}: uploaded {upload_path.name}")
@@ -2465,6 +2521,7 @@ async def worker() -> None:
                         file_folders,
                         force_dupes,
                         file_delay,
+                        file_handles,
                     ):
                         await handle_downloaded(path)
 
@@ -2741,11 +2798,12 @@ async def on_dupes(event) -> None:
         )
 
     # Part 2: the persistent skip history.
-    total_skips, pre_skips, hash_skips = skipped_stats()
+    total_skips, node_skips, pre_skips, hash_skips = skipped_stats()
     if total_skips:
         parts.append(
             f"Skipped so far: {total_skips} duplicate(s) "
-            f"({pre_skips} by name/size, {hash_skips} by hash)."
+            f"({node_skips} by file node, {pre_skips} by name/size, "
+            f"{hash_skips} by hash)."
         )
 
         recent = recent_skipped()
