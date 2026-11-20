@@ -18,7 +18,6 @@ from pathlib import Path
 from telethon import TelegramClient, events, Button
 from telethon.tl.functions.messages import (
     CreateForumTopicRequest,
-    GetForumTopicsRequest,
 )
 # Deleting a forum topic is done with messages.deleteTopicHistory, where
 # top_msg_id is the topic ID (the message ID of the topic's root service
@@ -203,9 +202,8 @@ TOPIC_ICON_COLORS = [
     0x6FB9F0, 0xFFD67E, 0xCB86DB, 0x8EEE98, 0xFF93B2, 0xFB6F5F,
 ]
 
-# Maximum number of existing forum topics fetched when checking for a
-# duplicate topic name before creating a new one (10 pages of 100).
-TOPIC_LOOKUP_LIMIT = 1000
+# Topic lookup uses the persistent local registry, not Telegram pagination.
+TOPIC_CREATE_LOCK = asyncio.Lock()
 
 client = TelegramClient(SESSION_PATH, API_ID, API_HASH)
 
@@ -552,10 +550,15 @@ def list_failed(
 
 
 def save_topic(topic_id: int, title: str) -> None:
-    """Remember a forum topic in the local registry."""
+    """Remember a forum topic, updating its title after a rename."""
+    if topic_id <= 0 or not title.strip():
+        raise ValueError("Topic ID must be positive and title must not be empty")
     with closing(db_connect()) as db, db:
         db.execute(
-            "INSERT OR IGNORE INTO topics (id, title) VALUES (?, ?)",
+            """
+            INSERT INTO topics (id, title) VALUES (?, ?)
+            ON CONFLICT(id) DO UPDATE SET title = excluded.title
+            """,
             (topic_id, title),
         )
 
@@ -1016,10 +1019,10 @@ def mega_api(body: list, handle: str | None = None) -> dict:
                 ):
                     delay = 2 * attempt
                     log(
-                        f"[mega] API error {first} "
-                        f"({MEGA_API_ERRORS.get(first, 'unknown')}); "
-                        f"retrying in {delay}s "
-                        f"({attempt + 1}/{MEGA_API_RETRIES})"
+                    f"[mega] API error {first} "
+                    f"({MEGA_API_ERRORS.get(first, 'unknown')}); "
+                    f"retrying in {delay}s "
+                    f"({attempt + 1}/{MEGA_API_RETRIES})"
                     )
                     time.sleep(delay)
                     continue
@@ -1361,30 +1364,30 @@ def download_file_blocking(
             with open(dest, "wb") as out:
                 while True:
                     if RUNNING["cancel"]:
-                        raise JobCancelled()
+                    raise JobCancelled()
 
                     chunk = response.read(DOWNLOAD_CHUNK)
                     if not chunk:
-                        break
+                    break
 
                     plain = decryptor.update(chunk)
                     if verifier:
-                        verifier.update(plain)
+                    verifier.update(plain)
 
                     out.write(plain)
                     written += len(plain)
 
                     now = time.monotonic()
                     if size and now - last_log >= PROGRESS_INTERVAL:
-                        last_log = now
-                        speed = written / max(now - started, 0.001)
-                        log(
-                            f"[dl] {dest.name}: "
-                            f"{written / size * 100:.1f}% "
-                            f"({format_size(written)} of "
-                            f"{format_size(size)}, "
-                            f"{format_size(speed)}/s)"
-                        )
+                    last_log = now
+                    speed = written / max(now - started, 0.001)
+                    log(
+                    f"[dl] {dest.name}: "
+                    f"{written / size * 100:.1f}% "
+                    f"({format_size(written)} of "
+                    f"{format_size(size)}, "
+                    f"{format_size(speed)}/s)"
+                    )
     except urllib.error.HTTPError as exc:
         if exc.code == 509:
             raise MegaBandwidthLimit(
@@ -1634,7 +1637,7 @@ async def iter_download(
                 waited = 0.0
                 while waited < MEGA_COOLDOWN:
                     if RUNNING["cancel"]:
-                        raise JobCancelled()
+                    raise JobCancelled()
 
                     step = min(1.0, MEGA_COOLDOWN - waited)
                     await asyncio.sleep(step)
@@ -2082,15 +2085,8 @@ async def get_or_create_folder_topic(
     folder_name: str,
     topic_cache: dict[str, int],
 ) -> int:
-    """Return the cached topic ID or create one for this MEGA folder.
-
-    Topics that already exist in the group under the same name
-    (case-insensitive) are reused instead of duplicated.
-    """
-    if folder_name in topic_cache:
-        return topic_cache[folder_name]
-
-    title = clamp_topic_name(folder_name)
+    """Resolve the folder through the persistent registry on every file."""
+    title = clamp_topic_name(folder_name.strip())
     if not title:
         raise RuntimeError("MEGA folder name is empty; cannot create topic")
 
@@ -2121,94 +2117,47 @@ async def create_topic(name: str) -> int:
     raise RuntimeError("Topic created, but its ID could not be determined.")
 
 
-async def find_existing_topic(title: str) -> int | None:
-    """Return the topic ID of an existing forum topic with this name.
+def topic_name_key(title: str) -> str:
+    """Compare titles without surrounding whitespace or case differences."""
+    return title.strip().casefold()
 
-    The Telegram group itself is queried (not the local registry), so
-    topics that were created manually or outside this bot are found as
-    well. The comparison is case-insensitive and ignores surrounding
-    whitespace. Returns None when no topic matches or the lookup
-    fails, so a broken lookup never blocks topic creation.
-    """
-    wanted = title.strip().casefold()
+
+async def find_existing_topic(title: str) -> int | None:
+    """Find a registered topic; database errors propagate to avoid duplicates."""
+    wanted = topic_name_key(title)
     if not wanted:
         return None
-
-    peer = await client.get_input_entity(CHAT_ID)
-    offset_date = 0
-    offset_id = 0
-    offset_topic = 0
-    fetched = 0
-
-    while fetched < TOPIC_LOOKUP_LIMIT:
-        try:
-            result = await client(
-                GetForumTopicsRequest(
-                    peer=peer,
-                    offset_date=offset_date,
-                    offset_id=offset_id,
-                    offset_topic=offset_topic,
-                    limit=100,
-                )
-            )
-        except Exception as exc:
-            log(f"[topic] Topic lookup failed: {exc}")
-            return None
-
-        topics = list(getattr(result, "topics", []) or [])
-        if not topics:
-            break
-
-        # Each topic's root service message comes with the response;
-        # its date feeds the pagination offset of the next page.
-        root_messages = {
-            message.id: message
-            for message in getattr(result, "messages", []) or []
-        }
-
-        for topic in topics:
-            topic_title = getattr(topic, "title", "") or ""
-            if topic_title.strip().casefold() == wanted:
-                topic_id = getattr(topic, "id", None)
-                if topic_id:
-                    return topic_id
-
-        fetched += len(topics)
-
-        if len(topics) < 100:
-            break
-
-        # Continue with the page after the last returned topic.
-        last = topics[-1]
-        offset_topic = getattr(last, "id", 0) or 0
-        offset_id = getattr(last, "top_message", 0) or offset_topic
-        root_message = root_messages.get(getattr(last, "top_message", 0))
-        if root_message is not None and getattr(root_message, "date", None):
-            offset_date = int(root_message.date.timestamp())
-
-    return None
+    matches = [
+        topic_id for topic_id, stored_title in saved_topics()
+        if topic_name_key(stored_title) == wanted
+    ]
+    if not matches:
+        return None
+    if len(matches) > 1:
+        log(
+            f"[topic] Multiple registered topics match '{title}': "
+            f"{matches}; reusing ID {matches[0]}"
+        )
+    return matches[0]
 
 
 async def get_or_create_topic(name: str) -> tuple[int, bool]:
-    """Return the topic ID for name, reusing an existing topic.
-
-    Returns (topic_id, created). created is False when a topic with
-    the same name (case-insensitive) already exists in the group; that
-    topic is then reused instead of creating a duplicate.
-    """
-    existing_id = await find_existing_topic(name)
-
-    if existing_id is not None:
-        log(
-            f"[topic] Topic '{name}' already exists "
-            f"(ID: {existing_id}); reusing it"
-        )
-        save_topic(existing_id, name)
-        return existing_id, False
-
-    topic_id = await create_topic(name)
-    save_topic(topic_id, name)
-    return topic_id, True
+    """Return (topic_id, created), reusing a registered matching topic."""
+    title = clamp_topic_name(name.strip())
+    if not title:
+        raise ValueError("Topic name must not be empty")
+    async with TOPIC_CREATE_LOCK:
+        existing_id = await find_existing_topic(title)
+        if existing_id is not None:
+            log(
+                f"[topic] Topic '{title}' found in local registry "
+                f"(ID: {existing_id}); reusing it"
+            )
+            return existing_id, False
+        topic_id = await create_topic(title)
+        save_topic(topic_id, title)
+        log(f"[topic] Created and registered topic '{title}' (ID: {topic_id})")
+        return topic_id, True
 
 
 async def resolve_target_topic(
@@ -2499,14 +2448,14 @@ async def worker() -> None:
                     skipped_count += 1
                     JOB_PROGRESS[job_id]["skipped"] += 1
                     mark_skipped(
-                        path.name,
-                        path.stat().st_size,
-                        "hash",
-                        job_id,
+                    path.name,
+                    path.stat().st_size,
+                    "hash",
+                    job_id,
                     )
                     log(
-                        f"[worker] Job #{job_id}: duplicate skipped: "
-                        f"{path.name} ({hash_value[:16]}...)"
+                    f"[worker] Job #{job_id}: duplicate skipped: "
+                    f"{path.name} ({hash_value[:16]}...)"
                     )
                     path.unlink(missing_ok=True)
                     return
@@ -2532,24 +2481,24 @@ async def worker() -> None:
                 file_topic_id = topic_id
                 if auto_folder_topics and folder_name:
                     try:
-                        file_topic_id = await get_or_create_folder_topic(
-                            folder_name, folder_topics
-                        )
+                    file_topic_id = await get_or_create_folder_topic(
+                    folder_name, folder_topics
+                    )
                     except Exception as exc:
-                        raise RuntimeError(
-                            f"Could not create topic for MEGA folder "
-                            f"'{folder_name}': {exc}"
-                        ) from exc
+                    raise RuntimeError(
+                    f"Could not create topic for MEGA folder "
+                    f"'{folder_name}': {exc}"
+                    ) from exc
 
                 if await upload_one(upload_path, file_topic_id):
                     file_count += 1
                     JOB_PROGRESS[job_id]["uploaded"] = file_count
                     mark_seen(
-                        hash_value,
-                        original_name,
-                        original_size,
-                        job_id,
-                        node_handle,
+                    hash_value,
+                    original_name,
+                    original_size,
+                    job_id,
+                    node_handle,
                     )
                     upload_path.unlink(missing_ok=True)
                     log(f"[worker] Job #{job_id}: uploaded {upload_path.name}")
@@ -2561,8 +2510,8 @@ async def worker() -> None:
                     kept_count += 1
                     JOB_PROGRESS[job_id]["kept"] = kept_count
                     log(
-                        f"[worker] Job #{job_id}: kept {upload_path.name} "
-                        "on the server"
+                    f"[worker] Job #{job_id}: kept {upload_path.name} "
+                    "on the server"
                     )
 
             with tempfile.TemporaryDirectory(dir=WORK_DIR) as temp_dir:
@@ -2571,31 +2520,31 @@ async def worker() -> None:
                 if link.startswith("yt:"):
                     # YouTube video(s) via yt-dlp.
                     for path in await run_ytdlp(
-                        link[3:], Path(temp_dir), YT_MAX_SIZE
+                    link[3:], Path(temp_dir), YT_MAX_SIZE
                     ):
-                        await handle_downloaded(path)
+                    await handle_downloaded(path)
 
                 elif link.startswith("nk:"):
                     # Netzkino movie via yt-dlp (built-in extractor).
                     for path in await run_ytdlp(
-                        link[3:], Path(temp_dir), NZ_MAX_SIZE
+                    link[3:], Path(temp_dir), NZ_MAX_SIZE
                     ):
-                        await handle_downloaded(path)
+                    await handle_downloaded(path)
 
                 else:
                     # MEGA: download and upload overlap file by file,
                     # so disk usage stays bounded by the largest file.
                     async for path in iter_download(
-                        link,
-                        Path(temp_dir),
-                        job_id,
-                        stats,
-                        file_folders,
-                        force_dupes,
-                        file_delay,
-                        file_handles,
+                    link,
+                    Path(temp_dir),
+                    job_id,
+                    stats,
+                    file_folders,
+                    force_dupes,
+                    file_delay,
+                    file_handles,
                     ):
-                        await handle_downloaded(path)
+                    await handle_downloaded(path)
 
             skipped_total = skipped_count + stats["skipped_pre"]
 
@@ -3172,18 +3121,54 @@ async def on_topics(event) -> None:
     await event.reply("\n".join(lines)[:4000], link_preview=False)
 
 
-@client.on(events.NewMessage())
-async def watch_topic_creation(event) -> None:
-    """Record topic-creation service messages to learn new topic IDs."""
-    if event.chat_id != CHAT_ID:
+@client.on(events.Raw())
+async def on_topic_service_message(update) -> None:
+    """Track topic service messages (NewMessage excludes service messages)."""
+    message = getattr(update, "message", None)
+    if message is None or getattr(message, "chat_id", None) != CHAT_ID:
+        return
+    action = getattr(message, "action", None)
+    kind = type(action).__name__
+    title = getattr(action, "title", None)
+    if not title or not title.strip():
         return
 
-    action = getattr(event.message, "action", None)
-    if type(action).__name__ != "MessageActionTopicCreate":
-        return
+    if kind == "MessageActionTopicCreate":
+        save_topic(message.id, title)
+        log(f"[topic] Learned topic '{title}' (ID: {message.id})")
+    elif kind == "MessageActionTopicEdit":
+        reply = getattr(message, "reply_to", None)
+        topic_id = (
+            getattr(reply, "reply_to_top_id", None)
+            or getattr(reply, "reply_to_msg_id", None)
+        )
+        if topic_id:
+            save_topic(topic_id, title)
+            log(f"[topic] Updated topic {topic_id}: '{title}'")
+        else:
+            log("[topic] Rename observed without topic ID; registry unchanged")
 
-    save_topic(event.message.id, action.title)
-    print(f"Learned new topic: {action.title} (ID: {event.message.id})", flush=True)
+
+@client.on(events.NewMessage(
+    pattern=rf"^{GAP}/addtopic(?:@\w+)?{GAP}\s+(\d+)\s+(.+)$"
+))
+async def on_addtopic(event) -> None:
+    """/addtopic <topic_id> <name> - register an existing topic manually."""
+    if not is_allowed(event):
+        return
+    topic_id = int(event.pattern_match.group(1))
+    title = INVISIBLE_RE.sub("", event.pattern_match.group(2)).strip()
+    if topic_id <= 0 or not title:
+        await event.reply("Usage: /addtopic <topic_id> <name>")
+        return
+    async with TOPIC_CREATE_LOCK:
+        save_topic(topic_id, title)
+    log(f"[topic] Manually registered topic '{title}' (ID: {topic_id})")
+    await event.reply(
+        f"Registered topic '{title}' (ID: {topic_id}). "
+        "This records the supplied mapping; it does not verify "
+        "the topic in Telegram."
+    )
 
 
 @client.on(events.NewMessage(pattern=rf"^{GAP}/(?:deltopic|topicrooms)(?:@\w+)?{GAP}(?:\s{GAP}(\S+))?(?:\s{GAP}(purge))?{GAP}$"))
@@ -3260,13 +3245,13 @@ async def on_deltopic(event) -> None:
                 try:
                     chat = await event.get_chat()
                     if DELETE_TOPIC_VARIANT == "messages":
-                        request = DeleteTopicHistoryRequest(
-                            peer=chat, top_msg_id=topic_id
-                        )
+                    request = DeleteTopicHistoryRequest(
+                    peer=chat, top_msg_id=topic_id
+                    )
                     else:
-                        request = DeleteTopicHistoryRequest(
-                            channel=chat, top_msg_id=topic_id
-                        )
+                    request = DeleteTopicHistoryRequest(
+                    channel=chat, top_msg_id=topic_id
+                    )
                     await event.client(request)
                     purged += 1
                 except Exception as error:
