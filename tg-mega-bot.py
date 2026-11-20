@@ -2137,7 +2137,7 @@ async def find_existing_topic(title: str) -> int | None:
     peer = await client.get_input_entity(CHAT_ID)
     offset_date = 0
     offset_id = 0
-    offset_topic_id = 0
+    offset_topic = 0
     fetched = 0
 
     while fetched < TOPIC_LOOKUP_LIMIT:
@@ -2147,7 +2147,7 @@ async def find_existing_topic(title: str) -> int | None:
                     peer=peer,
                     offset_date=offset_date,
                     offset_id=offset_id,
-                    offset_topic_id=offset_topic_id,
+                    offset_topic=offset_topic,
                     limit=100,
                 )
             )
@@ -2180,9 +2180,9 @@ async def find_existing_topic(title: str) -> int | None:
 
         # Continue with the page after the last returned topic.
         last = topics[-1]
-        offset_topic_id = getattr(last, "id", 0) or 0
-        offset_id = offset_topic_id
-        root_message = root_messages.get(offset_topic_id)
+        offset_topic = getattr(last, "id", 0) or 0
+        offset_id = getattr(last, "top_message", 0) or offset_topic
+        root_message = root_messages.get(getattr(last, "top_message", 0))
         if root_message is not None and getattr(root_message, "date", None):
             offset_date = int(root_message.date.timestamp())
 
