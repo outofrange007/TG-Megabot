@@ -1019,10 +1019,10 @@ def mega_api(body: list, handle: str | None = None) -> dict:
                 ):
                     delay = 2 * attempt
                     log(
-                    f"[mega] API error {first} "
-                    f"({MEGA_API_ERRORS.get(first, 'unknown')}); "
-                    f"retrying in {delay}s "
-                    f"({attempt + 1}/{MEGA_API_RETRIES})"
+                        f"[mega] API error {first} "
+                        f"({MEGA_API_ERRORS.get(first, 'unknown')}); "
+                        f"retrying in {delay}s "
+                        f"({attempt + 1}/{MEGA_API_RETRIES})"
                     )
                     time.sleep(delay)
                     continue
@@ -1364,30 +1364,30 @@ def download_file_blocking(
             with open(dest, "wb") as out:
                 while True:
                     if RUNNING["cancel"]:
-                    raise JobCancelled()
+                        raise JobCancelled()
 
                     chunk = response.read(DOWNLOAD_CHUNK)
                     if not chunk:
-                    break
+                        break
 
                     plain = decryptor.update(chunk)
                     if verifier:
-                    verifier.update(plain)
+                        verifier.update(plain)
 
                     out.write(plain)
                     written += len(plain)
 
                     now = time.monotonic()
                     if size and now - last_log >= PROGRESS_INTERVAL:
-                    last_log = now
-                    speed = written / max(now - started, 0.001)
-                    log(
-                    f"[dl] {dest.name}: "
-                    f"{written / size * 100:.1f}% "
-                    f"({format_size(written)} of "
-                    f"{format_size(size)}, "
-                    f"{format_size(speed)}/s)"
-                    )
+                        last_log = now
+                        speed = written / max(now - started, 0.001)
+                        log(
+                            f"[dl] {dest.name}: "
+                            f"{written / size * 100:.1f}% "
+                            f"({format_size(written)} of "
+                            f"{format_size(size)}, "
+                            f"{format_size(speed)}/s)"
+                        )
     except urllib.error.HTTPError as exc:
         if exc.code == 509:
             raise MegaBandwidthLimit(
@@ -1637,7 +1637,7 @@ async def iter_download(
                 waited = 0.0
                 while waited < MEGA_COOLDOWN:
                     if RUNNING["cancel"]:
-                    raise JobCancelled()
+                        raise JobCancelled()
 
                     step = min(1.0, MEGA_COOLDOWN - waited)
                     await asyncio.sleep(step)
@@ -2448,14 +2448,14 @@ async def worker() -> None:
                     skipped_count += 1
                     JOB_PROGRESS[job_id]["skipped"] += 1
                     mark_skipped(
-                    path.name,
-                    path.stat().st_size,
-                    "hash",
-                    job_id,
+                        path.name,
+                        path.stat().st_size,
+                        "hash",
+                        job_id,
                     )
                     log(
-                    f"[worker] Job #{job_id}: duplicate skipped: "
-                    f"{path.name} ({hash_value[:16]}...)"
+                        f"[worker] Job #{job_id}: duplicate skipped: "
+                        f"{path.name} ({hash_value[:16]}...)"
                     )
                     path.unlink(missing_ok=True)
                     return
@@ -2481,24 +2481,24 @@ async def worker() -> None:
                 file_topic_id = topic_id
                 if auto_folder_topics and folder_name:
                     try:
-                    file_topic_id = await get_or_create_folder_topic(
-                    folder_name, folder_topics
-                    )
+                        file_topic_id = await get_or_create_folder_topic(
+                            folder_name, folder_topics
+                        )
                     except Exception as exc:
-                    raise RuntimeError(
-                    f"Could not create topic for MEGA folder "
-                    f"'{folder_name}': {exc}"
-                    ) from exc
+                        raise RuntimeError(
+                            f"Could not create topic for MEGA folder "
+                            f"'{folder_name}': {exc}"
+                        ) from exc
 
                 if await upload_one(upload_path, file_topic_id):
                     file_count += 1
                     JOB_PROGRESS[job_id]["uploaded"] = file_count
                     mark_seen(
-                    hash_value,
-                    original_name,
-                    original_size,
-                    job_id,
-                    node_handle,
+                        hash_value,
+                        original_name,
+                        original_size,
+                        job_id,
+                        node_handle,
                     )
                     upload_path.unlink(missing_ok=True)
                     log(f"[worker] Job #{job_id}: uploaded {upload_path.name}")
@@ -2510,8 +2510,8 @@ async def worker() -> None:
                     kept_count += 1
                     JOB_PROGRESS[job_id]["kept"] = kept_count
                     log(
-                    f"[worker] Job #{job_id}: kept {upload_path.name} "
-                    "on the server"
+                        f"[worker] Job #{job_id}: kept {upload_path.name} "
+                        "on the server"
                     )
 
             with tempfile.TemporaryDirectory(dir=WORK_DIR) as temp_dir:
@@ -2520,31 +2520,31 @@ async def worker() -> None:
                 if link.startswith("yt:"):
                     # YouTube video(s) via yt-dlp.
                     for path in await run_ytdlp(
-                    link[3:], Path(temp_dir), YT_MAX_SIZE
+                        link[3:], Path(temp_dir), YT_MAX_SIZE
                     ):
-                    await handle_downloaded(path)
+                        await handle_downloaded(path)
 
                 elif link.startswith("nk:"):
                     # Netzkino movie via yt-dlp (built-in extractor).
                     for path in await run_ytdlp(
-                    link[3:], Path(temp_dir), NZ_MAX_SIZE
+                        link[3:], Path(temp_dir), NZ_MAX_SIZE
                     ):
-                    await handle_downloaded(path)
+                        await handle_downloaded(path)
 
                 else:
                     # MEGA: download and upload overlap file by file,
                     # so disk usage stays bounded by the largest file.
                     async for path in iter_download(
-                    link,
-                    Path(temp_dir),
-                    job_id,
-                    stats,
-                    file_folders,
-                    force_dupes,
-                    file_delay,
-                    file_handles,
+                        link,
+                        Path(temp_dir),
+                        job_id,
+                        stats,
+                        file_folders,
+                        force_dupes,
+                        file_delay,
+                        file_handles,
                     ):
-                    await handle_downloaded(path)
+                        await handle_downloaded(path)
 
             skipped_total = skipped_count + stats["skipped_pre"]
 
@@ -3245,13 +3245,13 @@ async def on_deltopic(event) -> None:
                 try:
                     chat = await event.get_chat()
                     if DELETE_TOPIC_VARIANT == "messages":
-                    request = DeleteTopicHistoryRequest(
-                    peer=chat, top_msg_id=topic_id
-                    )
+                        request = DeleteTopicHistoryRequest(
+                            peer=chat, top_msg_id=topic_id
+                        )
                     else:
-                    request = DeleteTopicHistoryRequest(
-                    channel=chat, top_msg_id=topic_id
-                    )
+                        request = DeleteTopicHistoryRequest(
+                            channel=chat, top_msg_id=topic_id
+                        )
                     await event.client(request)
                     purged += 1
                 except Exception as error:
