@@ -6,20 +6,37 @@ import os
 import random
 import re
 import shutil
+import signal
 import sqlite3
-import subprocess
 import tempfile
 import time
 import urllib.error
 import urllib.request
-from contextlib import closing
+from urllib.parse import unquote, urljoin, urlsplit, urlunsplit
+from contextlib import aclosing, closing, suppress
 from pathlib import Path
 
 from PIL import Image, ImageOps
 from telethon import TelegramClient, events, Button
-from telethon.tl.functions.messages import (
-    CreateForumTopicRequest,
+from telethon.errors import (
+    ImageProcessFailedError,
+    MediaInvalidError,
+    PhotoInvalidDimensionsError,
+    PhotoSaveFileInvalidError,
+    TopicDeletedError,
 )
+
+# Forum topic creation moved from the channels namespace (Telethon
+# <= 1.41, keyword "channel") to the messages namespace (Telethon
+# >= 1.42, keyword "peer"). Support both so an older pinned Telethon
+# does not crash the bot at import time.
+try:
+    from telethon.tl.functions.messages import CreateForumTopicRequest
+    CREATE_TOPIC_PEER_KWARG = "peer"
+except ImportError:
+    from telethon.tl.functions.channels import CreateForumTopicRequest
+    CREATE_TOPIC_PEER_KWARG = "channel"
+
 # Deleting a forum topic is done with messages.deleteTopicHistory, where
 # top_msg_id is the topic ID (the message ID of the topic's root service
 # message). Some Telethon generations expose the same request in the
@@ -52,6 +69,18 @@ try:
 except ImportError:
     HAVE_FAST_CRYPTO = False
 
+try:
+    # Bunkr support: plain HTTP scraping. Optional at import time so a
+    # missing package only disables /bunkr instead of the whole bot.
+    import requests
+    from bs4 import BeautifulSoup, FeatureNotFound
+    HAVE_BUNKR_DEPS = True
+except ImportError:
+    requests = None
+    BeautifulSoup = None
+    FeatureNotFound = Exception
+    HAVE_BUNKR_DEPS = False
+
 # ---- Configuration ----
 API_ID = int(os.environ["TG_API_ID"])
 API_HASH = os.environ["TG_API_HASH"]
@@ -78,7 +107,10 @@ DATA_DIR = Path(
     os.environ.get("DATA_DIR", "/data" if os.path.isdir("/data") else ".")
 )
 DB_PATH = str(DATA_DIR / "queue.sqlite3")
-SESSION_PATH = str(DATA_DIR / "bot_session")
+# Telethon appends ".session"; the default keeps existing deployments
+# (DATA_DIR/bot_session.session) logged in. Override with SESSION_NAME.
+SESSION_NAME = os.environ.get("SESSION_NAME", "bot_session").strip() or "bot_session"
+SESSION_PATH = str(DATA_DIR / SESSION_NAME)
 KEPT_DIR = DATA_DIR / "kept"
 
 # Telegram upload limit safety threshold: files above this are split
@@ -186,9 +218,48 @@ NEWTOPIC_REGEX = re.compile(
 # registry already knows, instead of skipping them.
 DUPES_REGEX = re.compile(r"(?:^|\s)-dupes(?:\s|$)", re.IGNORECASE)
 
+# ---- Bunkr configuration ----
+# Known Bunkr site domains. Album pages live at /a/<id>, file pages at
+# /f/<slug>, /v/<slug> (video) and /i/<slug> (image).
+BUNKR_DOMAINS = {
+    "bunkr.si", "bunkr.su", "bunkr.ru", "bunkr.black",
+    "bunkr.media", "bunkr.is", "bunkr.to", "bunkr.la",
+    "bunkr.fi", "bunkr.pk",
+}
+BUNKR_FILE_PATH_PREFIXES = ("/f/", "/v/", "/i/")
+BUNKR_ALBUM_PATH_PREFIX = "/a/"
+
+# Candidate URLs in a message; the host is checked against BUNKR_DOMAINS
+# afterwards, so this pattern can stay generic.
+BUNKR_URL_REGEX = re.compile(
+    r"https?://[\w.-]+/(?:a|f|v|i)/[^\s<>\"']+", re.IGNORECASE
+)
+
+# First host label of Bunkr CDN servers, e.g. cdn12, i-cdn, media-files3,
+# burger, pizza, taquito, milkshake, mozzarella, nachos.
+BUNKR_CDN_LABEL_REGEX = re.compile(
+    r"^(?:i-)?(?:cdn|media-files|burger|pizza|taquito|milkshake|"
+    r"mozzarella|nachos)\d*$",
+    re.IGNORECASE,
+)
+
+BUNKR_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+)
+# Back-off before retry 1, 2 and 3 after HTTP 429, 5xx or a connection error.
+BUNKR_RETRY_DELAYS = (10, 30, 60)
+# (connect, read) timeouts in seconds for Bunkr page and CDN requests.
+BUNKR_TIMEOUT = (15, 60)
+# Streaming download chunk size.
+BUNKR_CHUNK = 8192
+# Pause between two files of an album, to stay below Bunkr's rate limit.
+BUNKR_FILE_DELAY = env_float("BUNKR_FILE_DELAY", 1.0)
+
 # Queued jobs are prefixed with their source so the worker can pick the
-# right downloader: "yt:<url>" for YouTube, "nk:<url>" for Netzkino and
-# unprefixed MEGA links (the original format).
+# right downloader: "yt:<url>" for YouTube, "nk:<url>" for Netzkino,
+# "bk:<url>" for Bunkr albums/files and unprefixed MEGA links (the
+# original format).
 
 # ---- Pasted-text hardening ----
 # Invisible Unicode characters (zero-width spaces, direction marks, word
@@ -206,7 +277,23 @@ TOPIC_ICON_COLORS = [
 # Topic lookup uses the persistent local registry, not Telegram pagination.
 TOPIC_CREATE_LOCK = asyncio.Lock()
 
+# The session file lives in DATA_DIR and Telethon opens it in the
+# constructor, so the directory must exist before the client is built.
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
 client = TelegramClient(SESSION_PATH, API_ID, API_HASH)
+
+# Strong references to fire-and-forget tasks; the event loop only keeps
+# weak references, so unreferenced tasks may be garbage collected early.
+BACKGROUND_TASKS: set[asyncio.Task] = set()
+
+
+def spawn(coro) -> asyncio.Task:
+    """Start a background task and keep it referenced until it finishes."""
+    task = asyncio.create_task(coro)
+    BACKGROUND_TASKS.add(task)
+    task.add_done_callback(BACKGROUND_TASKS.discard)
+    return task
 
 
 # ---- Logging helpers ----
@@ -1010,7 +1097,10 @@ def mega_api(body: list, handle: str | None = None) -> dict:
             ) as response:
                 result = json.loads(response.read().decode())
 
-            first = result[0]
+            # MEGA answers with a list of per-command results, but a
+            # request-level error (e.g. -3 under load) arrives as a bare
+            # integer instead of a list.
+            first = result if isinstance(result, int) else result[0]
             if isinstance(first, int):
                 # Transient errors (rate limits, expired public handle)
                 # get a short backoff before the caller sees them.
@@ -1020,10 +1110,10 @@ def mega_api(body: list, handle: str | None = None) -> dict:
                 ):
                     delay = 2 * attempt
                     log(
-                    f"[mega] API error {first} "
-                    f"({MEGA_API_ERRORS.get(first, 'unknown')}); "
-                    f"retrying in {delay}s "
-                    f"({attempt + 1}/{MEGA_API_RETRIES})"
+                        f"[mega] API error {first} "
+                        f"({MEGA_API_ERRORS.get(first, 'unknown')}); "
+                        f"retrying in {delay}s "
+                        f"({attempt + 1}/{MEGA_API_RETRIES})"
                     )
                     time.sleep(delay)
                     continue
@@ -1075,6 +1165,12 @@ def list_public_folder(
     sub_handle = sub_match.group(1) if sub_match else None
     nodes = request_folder_nodes(handle)
     by_handle = {node["h"]: node for node in nodes}
+    # Validate the selected subtree before anything indexes by_handle
+    # with it; an unknown handle used to raise a bare KeyError.
+    if sub_handle and sub_handle not in by_handle:
+        raise RuntimeError(
+            "Selected subfolder or file is not part of the shared folder"
+        )
     # The share's top-level folder node(s); their names stay out of the
     # reconstructed paths so topic routing sees the folders BELOW the
     # share root instead of the share's own name.
@@ -1127,10 +1223,6 @@ def list_public_folder(
     # itself and everything below it.
     allowed: set[str] | None = None
     if sub_handle:
-        if sub_handle not in by_handle:
-            raise RuntimeError(
-                "Selected subfolder or file is not part of the shared folder"
-            )
         children: dict[str, list[str]] = {}
         for node in nodes:
             children.setdefault(node.get("p"), []).append(node["h"])
@@ -1720,13 +1812,6 @@ def make_progress_logger(name: str):
     return callback
 
 
-from telethon.errors import (
-    PhotoInvalidDimensionsError,
-    PhotoSaveFileInvalidError,
-    ImageProcessFailedError,
-    MediaInvalidError,
-)
-
 async def send_file(path: Path, topic_id: int | None, progress=None) -> None:
     """Send prepared media; retry Telegram processing errors as a document."""
     if RUNNING["cancel"]:
@@ -1881,7 +1966,7 @@ async def ask_large_file(path: Path, topic_id: int | None) -> str:
         # Timeout: tidy the prompt away and split, as before.
         try:
             await prompt.edit("No choice received; splitting by default.")
-            asyncio.create_task(
+            spawn(
                 delete_status([prompt], STATUS_DELETE_DELAY)
             )
         except Exception:
@@ -1891,7 +1976,7 @@ async def ask_large_file(path: Path, topic_id: int | None) -> str:
 
     try:
         await prompt.edit(f"{path.name}: {ASK_ANSWERS[choice]}")
-        asyncio.create_task(delete_status([prompt], STATUS_DELETE_DELAY))
+        spawn(delete_status([prompt], STATUS_DELETE_DELAY))
     except Exception:
         pass
 
@@ -2077,6 +2162,502 @@ async def run_ytdlp(url: str, target: Path, max_size: int) -> list[Path]:
     return files
 
 
+# ---- Bunkr via requests + BeautifulSoup ----
+# /bunkr (alias /bk) queues "bk:<url>" jobs. Album pages (/a/<id>) are
+# scraped for their file page links (/f/, /v/, /i/); every file page is
+# scraped for the direct CDN URL, which is streamed to a temp file. The
+# worker then runs the same path as MEGA files: SHA-256 duplicate check,
+# local media preparation, upload into the topic, hash registration and
+# temp-file removal. The blocking HTTP helpers run in worker threads.
+
+
+class BunkrError(RuntimeError):
+    """A Bunkr page or file could not be fetched or parsed."""
+
+
+def _bunkr_host(url: str) -> str:
+    """Return the lowercase host of a URL without a leading 'www.'."""
+    host = (urlsplit(url).hostname or "").lower().rstrip(".")
+    return host[4:] if host.startswith("www.") else host
+
+
+def is_bunkr_url(url: str) -> bool:
+    """Return True when the URL's host is a known Bunkr site domain."""
+    try:
+        return _bunkr_host(url) in BUNKR_DOMAINS
+    except ValueError:
+        return False
+
+
+def is_bunkr_cdn_url(url: str) -> bool:
+    """Return True for a Bunkr CDN host such as cdn12.bunkr.ru."""
+    try:
+        host = (urlsplit(url).hostname or "").lower().rstrip(".")
+    except ValueError:
+        return False
+    for domain in BUNKR_DOMAINS:
+        if host.endswith("." + domain):
+            label = host[: -len(domain) - 1].split(".")[-1]
+            return bool(BUNKR_CDN_LABEL_REGEX.match(label))
+    return False
+
+
+def bunkr_links_in(text: str) -> list[str]:
+    """Return the Bunkr album/file URLs contained in a message text."""
+    links = []
+    for url in clean_urls(BUNKR_URL_REGEX.findall(text)):
+        path = urlsplit(url).path
+        if is_bunkr_url(url) and (
+            path.startswith(BUNKR_ALBUM_PATH_PREFIX)
+            or path.startswith(BUNKR_FILE_PATH_PREFIXES)
+        ):
+            links.append(url)
+    return links
+
+
+def bunkr_session():
+    """Create a requests session with browser-like default headers."""
+    if not HAVE_BUNKR_DEPS:
+        raise BunkrError(
+            "Bunkr support needs the requests and beautifulsoup4 packages: "
+            "pip install requests beautifulsoup4 lxml"
+        )
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": BUNKR_USER_AGENT,
+        "Accept": (
+            "text/html,application/xhtml+xml,application/xml;q=0.9,"
+            "*/*;q=0.8"
+        ),
+        "Accept-Language": "en-US,en;q=0.9",
+    })
+    return session
+
+
+def _bunkr_sleep(seconds: float) -> None:
+    """Sleep in a worker thread while honouring /cancel once per second."""
+    waited = 0.0
+    while waited < seconds:
+        if RUNNING["cancel"]:
+            raise JobCancelled()
+        step = min(1.0, seconds - waited)
+        time.sleep(step)
+        waited += step
+
+
+def bunkr_request(
+    session,
+    url: str,
+    *,
+    stream: bool = False,
+    headers: dict | None = None,
+    what: str = "page",
+):
+    """GET a Bunkr URL, retrying on HTTP 429, 5xx and connection errors.
+
+    The waits before the three retries follow BUNKR_RETRY_DELAYS
+    (10s, 30s, 60s); a longer Retry-After header (capped at 5 minutes)
+    wins. HTTP 403, 404 and other client errors fail immediately with a
+    descriptive BunkrError. Returns the open response.
+    """
+    attempts = len(BUNKR_RETRY_DELAYS) + 1
+    last_error = "unknown error"
+
+    for attempt in range(attempts):
+        if RUNNING["cancel"]:
+            raise JobCancelled()
+
+        retry_after = 0
+        try:
+            response = session.get(
+                url,
+                stream=stream,
+                headers=headers,
+                timeout=BUNKR_TIMEOUT,
+                allow_redirects=True,
+            )
+        except (requests.ConnectionError, requests.Timeout) as exc:
+            last_error = f"connection error: {exc}"
+        else:
+            status = response.status_code
+            if status == 429 or status >= 500:
+                last_error = (
+                    "HTTP 429 (rate limited)" if status == 429
+                    else f"HTTP {status} (server error)"
+                )
+                header = response.headers.get("Retry-After", "")
+                if header.isdigit():
+                    retry_after = min(int(header), 300)
+                response.close()
+            elif status >= 400:
+                response.close()
+                if status == 403:
+                    reason = "access denied (blocked IP or hotlink protection)"
+                elif status == 404:
+                    reason = "not found (removed or wrong link)"
+                else:
+                    reason = "client error"
+                raise BunkrError(f"HTTP {status} for Bunkr {what} {url}: {reason}")
+            else:
+                return response
+
+        if attempt < len(BUNKR_RETRY_DELAYS):
+            delay = max(BUNKR_RETRY_DELAYS[attempt], retry_after)
+            log(
+                f"[bk] {what} request failed ({last_error}); retrying in "
+                f"{delay}s ({attempt + 2}/{attempts})"
+            )
+            _bunkr_sleep(delay)
+
+    raise BunkrError(
+        f"Giving up on Bunkr {what} {url} after {attempts} attempts: "
+        f"{last_error}"
+    )
+
+
+def _bunkr_soup(html: str):
+    """Parse HTML with lxml when installed, else the stdlib parser."""
+    try:
+        return BeautifulSoup(html, "lxml")
+    except FeatureNotFound:
+        return BeautifulSoup(html, "html.parser")
+
+
+def parse_bunkr_album(html: str, base_url: str) -> tuple[str | None, list[str]]:
+    """Return (album title, file page URLs) from album page HTML.
+
+    File page links are <a href> targets on any Bunkr domain whose path
+    starts with /f/, /v/ or /i/; relative links are resolved against
+    base_url, query strings dropped and duplicates removed in order.
+    """
+    soup = _bunkr_soup(html)
+    links: list[str] = []
+    seen: set[str] = set()
+
+    for anchor in soup.find_all("a", href=True):
+        href = urljoin(base_url, anchor["href"].strip())
+        parts = urlsplit(href)
+        if parts.scheme not in ("http", "https") or not is_bunkr_url(href):
+            continue
+        if not parts.path.startswith(BUNKR_FILE_PATH_PREFIXES):
+            continue
+        clean = urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
+        if clean not in seen:
+            seen.add(clean)
+            links.append(clean)
+
+    title = None
+    og_title = soup.find("meta", attrs={"property": "og:title"})
+    if og_title and og_title.get("content", "").strip():
+        title = og_title["content"].strip()
+    elif soup.h1 and soup.h1.get_text(strip=True):
+        title = soup.h1.get_text(" ", strip=True)
+    elif soup.title and soup.title.get_text(strip=True):
+        title = soup.title.get_text(" ", strip=True)
+    if title:
+        # Drop a trailing site name such as " | Bunkr" or " - Bunkr".
+        title = re.sub(r"\s*[|\-\u2013]\s*bunkr\b.*$", "", title, flags=re.I)
+        title = title.strip() or None
+
+    return title, links
+
+
+def bunkr_filename(cdn_url: str, fallback: str = "bunkr_file") -> str:
+    """Return a safe local filename from the last URL path segment."""
+    name = unquote(urlsplit(cdn_url).path.rsplit("/", 1)[-1])
+    name = re.sub(r"[\x00-\x1f/\\]+", "_", name).strip(" .")
+    if not name:
+        name = re.sub(r"[^\w.-]+", "_", fallback).strip("._") or "bunkr_file"
+    # Keep the name within common filesystem limits, preserving the suffix.
+    if len(name.encode("utf-8")) > 200:
+        suffix = Path(name).suffix[:16]
+        stem = name[: len(name) - len(suffix)]
+        stem = stem.encode("utf-8")[: 200 - len(suffix.encode())]
+        name = stem.decode("utf-8", errors="ignore") + suffix
+    return name
+
+
+def parse_bunkr_file_page(html: str, page_url: str) -> tuple[str, str]:
+    """Return (direct CDN URL, filename) from file page HTML.
+
+    Order: <source src> (video/audio player), then <a href> pointing to
+    a Bunkr CDN host (download button), then <video src> and <img src>
+    on a CDN host (image pages). Raises BunkrError when nothing fits.
+    """
+    soup = _bunkr_soup(html)
+
+    def absolute(value: str) -> str | None:
+        url = urljoin(page_url, value.strip())
+        return url if urlsplit(url).scheme in ("http", "https") else None
+
+    candidates: list[str] = []
+    for tag in soup.find_all("source", src=True):
+        url = absolute(tag["src"])
+        if url:
+            candidates.append(url)
+    for tag in soup.find_all("a", href=True):
+        url = absolute(tag["href"])
+        if url and is_bunkr_cdn_url(url):
+            candidates.append(url)
+    for tag in soup.find_all(["video", "img"], src=True):
+        url = absolute(tag["src"])
+        if url and is_bunkr_cdn_url(url):
+            candidates.append(url)
+
+    if not candidates:
+        raise BunkrError(
+            f"No direct download link found on {page_url}: no <source src> "
+            "and no CDN <a href>. The file may be removed or the page may "
+            "need JavaScript."
+        )
+
+    cdn_url = candidates[0]
+    slug = urlsplit(page_url).path.rstrip("/").rsplit("/", 1)[-1]
+    return cdn_url, bunkr_filename(cdn_url, fallback=slug)
+
+
+def fetch_bunkr_album(
+    album_url: str, session=None
+) -> tuple[str | None, list[str]]:
+    """Download an album page and return (title, file page URLs)."""
+    own_session = session is None
+    session = session or bunkr_session()
+    try:
+        response = bunkr_request(session, album_url, what="album page")
+        with response:
+            title, links = parse_bunkr_album(response.text, response.url)
+    finally:
+        if own_session:
+            session.close()
+
+    if not links:
+        raise BunkrError(
+            f"Bunkr album {album_url} contains no file links (empty, removed "
+            "or rendered by JavaScript)"
+        )
+    log(f"[bk] Album '{title or album_url}': {len(links)} file page(s)")
+    return title, links
+
+
+def extract_bunkr_links(album_or_file_url: str, session=None) -> list[str]:
+    """Return the file page URLs behind a Bunkr album or file URL.
+
+    /a/<id> album pages are fetched and scraped; /f/, /v/ and /i/ file
+    page URLs are returned unchanged as a one-element list.
+    """
+    path = urlsplit(album_or_file_url).path
+    if path.startswith(BUNKR_FILE_PATH_PREFIXES):
+        return [album_or_file_url]
+    if path.startswith(BUNKR_ALBUM_PATH_PREFIX):
+        return fetch_bunkr_album(album_or_file_url, session)[1]
+    raise BunkrError(
+        f"Unsupported Bunkr URL {album_or_file_url}: expected /a/, /f/, /v/ "
+        "or /i/"
+    )
+
+
+def get_bunkr_direct_url(file_page_url: str, session=None) -> tuple[str, str]:
+    """Fetch a Bunkr file page and return (direct CDN URL, filename)."""
+    own_session = session is None
+    session = session or bunkr_session()
+    try:
+        response = bunkr_request(session, file_page_url, what="file page")
+        with response:
+            return parse_bunkr_file_page(response.text, response.url)
+    finally:
+        if own_session:
+            session.close()
+
+
+def _bunkr_referer(url: str) -> str:
+    """Return the base URL of the Bunkr site that a URL belongs to."""
+    host = _bunkr_host(url)
+    for domain in BUNKR_DOMAINS:
+        if host == domain or host.endswith("." + domain):
+            return f"https://{domain}/"
+    return "https://bunkr.si/"
+
+
+def download_bunkr_file(
+    cdn_url: str,
+    dest_path: str,
+    progress_cb=None,
+    referer: str | None = None,
+    session=None,
+) -> None:
+    """Stream a Bunkr CDN file to dest_path in BUNKR_CHUNK-sized chunks.
+
+    Sends the browser User-Agent plus a Referer of the Bunkr page base
+    (CDNs reject hotlinks without it). progress_cb(bytes_done, total)
+    is called per chunk; total is 0 when the server sends no length.
+    Data goes to "<dest>.part" first and is renamed only when complete,
+    so a failed download never leaves a truncated file behind.
+    """
+    dest = Path(dest_path)
+    part = dest.with_name(dest.name + ".part")
+    own_session = session is None
+    session = session or bunkr_session()
+    headers = {"Referer": referer or _bunkr_referer(cdn_url)}
+
+    try:
+        response = bunkr_request(
+            session, cdn_url, stream=True, headers=headers, what="file"
+        )
+        with response:
+            content_type = response.headers.get("Content-Type", "").lower()
+            if content_type.startswith("text/html"):
+                raise BunkrError(
+                    f"CDN returned an HTML page instead of the file for "
+                    f"{cdn_url} (maintenance or blocked)"
+                )
+            # Content-Length is only comparable to the decoded byte count
+            # when the body is not transfer-compressed.
+            total = int(response.headers.get("Content-Length") or 0)
+            if response.headers.get("Content-Encoding"):
+                total = 0
+
+            written = 0
+            with open(part, "wb") as out:
+                for chunk in response.iter_content(BUNKR_CHUNK):
+                    if RUNNING["cancel"]:
+                        raise JobCancelled()
+                    if not chunk:
+                        continue
+                    out.write(chunk)
+                    written += len(chunk)
+                    if progress_cb:
+                        progress_cb(written, total)
+
+        if written == 0:
+            raise BunkrError(f"CDN sent an empty file for {cdn_url}")
+        if total and written != total:
+            raise BunkrError(
+                f"Incomplete Bunkr download: {written} of {total} bytes"
+            )
+        part.replace(dest)
+    except BaseException:
+        part.unlink(missing_ok=True)
+        raise
+    finally:
+        if own_session:
+            session.close()
+
+
+def make_download_logger(name: str):
+    """Log Bunkr download progress at most every PROGRESS_INTERVAL seconds."""
+    started = time.monotonic()
+    last_logged = started
+
+    def callback(current: int, total: int) -> None:
+        nonlocal last_logged
+        now = time.monotonic()
+        if now - last_logged < PROGRESS_INTERVAL:
+            return
+        last_logged = now
+        speed = current / max(now - started, 0.001)
+        if total:
+            log(
+                f"[bk] {name}: {current / total * 100:.1f}% "
+                f"({format_size(current)} of {format_size(total)}, "
+                f"{format_size(speed)}/s)"
+            )
+        else:
+            log(f"[bk] {name}: {format_size(current)} ({format_size(speed)}/s)")
+
+    return callback
+
+
+async def iter_bunkr(
+    link: str,
+    temp_dir: Path,
+    job_id: int,
+    file_folders: dict[str, str | None] | None = None,
+    status_cb=None,
+):
+    """Download a Bunkr album or file one by one, yielding each file.
+
+    Mirrors iter_download for MEGA folders: one fresh subfolder per
+    file keeps disk usage bounded by the largest file, a broken file
+    does not stop the album, and JOB_PROGRESS feeds /queue. For album
+    links, file_folders maps each path to the album title so the worker
+    can route it into a per-album topic. status_cb(text) is awaited
+    with "Bunkr: <n>/<total> - <filename>" before each download.
+    """
+    if RUNNING["cancel"]:
+        raise JobCancelled()
+
+    session = bunkr_session()
+    try:
+        album_title = None
+        if urlsplit(link).path.startswith(BUNKR_ALBUM_PATH_PREFIX):
+            album_title, pages = await asyncio.to_thread(
+                fetch_bunkr_album, link, session
+            )
+        else:
+            pages = await asyncio.to_thread(extract_bunkr_links, link, session)
+
+        total = len(pages)
+        failed = 0
+        last_error = ""
+        progress = JOB_PROGRESS.setdefault(job_id, {})
+        progress.update(total=total, current=0, current_name="")
+
+        for index, page_url in enumerate(pages, start=1):
+            if RUNNING["cancel"]:
+                raise JobCancelled()
+            if index > 1 and BUNKR_FILE_DELAY > 0:
+                await asyncio.sleep(BUNKR_FILE_DELAY)
+
+            progress["current"] = index
+            try:
+                cdn_url, filename = await asyncio.to_thread(
+                    get_bunkr_direct_url, page_url, session
+                )
+                progress["current_name"] = filename
+                log(f"[bk] ({index}/{total}) Downloading {filename}")
+                if status_cb is not None:
+                    await status_cb(f"Bunkr: {index}/{total} \u2014 {filename}")
+
+                sub_dir = temp_dir / f"bunkr{index:04d}"
+                sub_dir.mkdir()
+                dest = sub_dir / filename
+                await asyncio.to_thread(
+                    download_bunkr_file,
+                    cdn_url,
+                    str(dest),
+                    make_download_logger(filename),
+                    _bunkr_referer(page_url),
+                    session,
+                )
+            except JobCancelled:
+                raise
+            except Exception as exc:
+                # One broken file should not kill the whole album job.
+                failed += 1
+                last_error = str(exc) or type(exc).__name__
+                progress["failed"] = progress.get("failed", 0) + 1
+                log(f"[bk] ({index}/{total}) Failed {page_url}: {last_error}")
+                continue
+
+            log(
+                f"[bk] ({index}/{total}) Downloaded {filename} "
+                f"({format_size(dest.stat().st_size)})"
+            )
+            if file_folders is not None:
+                file_folders[str(dest)] = album_title
+            yield dest
+
+        if failed:
+            log(f"[bk] {failed} of {total} file(s) failed")
+            if failed == total:
+                raise BunkrError(
+                    f"All {total} Bunkr file(s) failed; last error: "
+                    f"{last_error}"
+                )
+    finally:
+        session.close()
+
+
 # ---- Helpers ----
 def get_topic_id(event) -> int | None:
     """Get the forum topic ID from the command message, if available."""
@@ -2142,9 +2723,10 @@ async def get_or_create_folder_topic(
 
 async def create_topic(name: str) -> int:
     """Create a forum topic and return its topic ID."""
+    peer = await client.get_input_entity(CHAT_ID)
     result = await client(
         CreateForumTopicRequest(
-            peer=await client.get_input_entity(CHAT_ID),
+            **{CREATE_TOPIC_PEER_KWARG: peer},
             title=name,
             icon_color=random.choice(TOPIC_ICON_COLORS),
             random_id=random.getrandbits(63),
@@ -2152,12 +2734,13 @@ async def create_topic(name: str) -> int:
     )
 
     # The response contains the topic-creation service message; its ID
-    # is the topic ID used for posting.
+    # is the topic ID used for posting. Topic IDs are always positive.
     for update in getattr(result, "updates", []):
         message = getattr(update, "message", None)
         action = getattr(message, "action", None)
         if type(action).__name__ == "MessageActionTopicCreate":
-            return message.id
+            if isinstance(message.id, int) and message.id > 0:
+                return message.id
 
     raise RuntimeError("Topic created, but its ID could not be determined.")
 
@@ -2239,7 +2822,12 @@ async def resolve_target_topic(
         return topic_id, None
 
     if topic_match:
-        return int(topic_match.group(1)), None
+        explicit_id = int(topic_match.group(1))
+        # Topic IDs are positive message IDs; "-t 0" would silently post
+        # into the General topic instead of the intended one.
+        if explicit_id <= 0:
+            return None, "Topic IDs are positive numbers, e.g. -t 42."
+        return explicit_id, None
 
     return get_topic_id(event), None
 
@@ -2480,10 +3068,50 @@ async def prepare_video_for_telegram(path: Path) -> Path:
 
 
 # ---- Queue worker ----
+def requeue_running_jobs() -> int:
+    """Reset orphaned 'running' jobs to 'pending'; return how many.
+
+    There is exactly one worker, so a 'running' row without a live
+    worker iteration was interrupted (crash or shutdown).
+    """
+    with closing(db_connect()) as db, db:
+        cursor = db.execute(
+            "UPDATE jobs SET status = 'pending' WHERE status = 'running'"
+        )
+        return cursor.rowcount
+
+
 async def worker() -> None:
-    """Process queued jobs one at a time."""
+    """Supervise the queue loop and restart it after unexpected errors.
+
+    Without this, a single unexpected exception (for example a SQLite
+    error inside an error handler) would end the worker task silently
+    and the queue would stop until the container restarts.
+    """
     log("[worker] Queue worker started")
 
+    while True:
+        try:
+            await _worker_loop()
+        except asyncio.CancelledError:
+            log("[worker] Queue worker stopped")
+            raise
+        except Exception as exc:
+            log(
+                f"[worker] Unexpected error ({type(exc).__name__}: {exc}); "
+                "restarting the queue loop in 5s"
+            )
+            try:
+                requeued = requeue_running_jobs()
+                if requeued:
+                    log(f"[worker] Re-queued {requeued} interrupted job(s)")
+            except Exception as db_exc:
+                log(f"[worker] Could not re-queue interrupted jobs: {db_exc}")
+            await asyncio.sleep(5)
+
+
+async def _worker_loop() -> None:
+    """Process queued jobs one at a time."""
     while True:
         job = claim_job()
 
@@ -2570,12 +3198,31 @@ async def worker() -> None:
                         )
                     except Exception as exc:
                         raise RuntimeError(
-                            f"Could not create topic for MEGA folder "
+                            f"Could not create topic for folder "
                             f"'{folder_name}': {exc}"
                         ) from exc
 
                 # Size checks and splitting apply to the prepared file.
-                if await upload_one(upload_path, file_topic_id):
+                try:
+                    uploaded = await upload_one(upload_path, file_topic_id)
+                except TopicDeletedError:
+                    # A registered folder topic was deleted in Telegram.
+                    # Forget the stale ID, recreate the topic once and
+                    # retry; explicit targets (-t/-newtopic) still fail.
+                    if not (auto_folder_topics and folder_name):
+                        raise
+                    log(
+                        f"[topic] Topic {file_topic_id} for folder "
+                        f"'{folder_name}' was deleted; recreating it"
+                    )
+                    forget_topic(file_topic_id)
+                    folder_topics.pop(folder_name, None)
+                    file_topic_id = await get_or_create_folder_topic(
+                        folder_name, folder_topics
+                    )
+                    uploaded = await upload_one(upload_path, file_topic_id)
+
+                if uploaded:
                     file_count += 1
                     JOB_PROGRESS[job_id]["uploaded"] = file_count
                     mark_seen(
@@ -2608,8 +3255,33 @@ async def worker() -> None:
                     ):
                         await handle_downloaded(path)
 
+                elif link.startswith("bk:"):
+                    async def bunkr_status(text: str) -> None:
+                        """Show per-file progress in the start message."""
+                        if start_message is None:
+                            return
+                        try:
+                            await start_message.edit(f"Job #{job_id}: {text}")
+                        except Exception as exc:
+                            log(f"[bunkr] Status update failed: {exc}")
+
+                    # Same pipeline as MEGA: each downloaded file goes
+                    # through hash dedup, preparation and upload.
+                    async with aclosing(iter_bunkr(
+                        link[3:],
+                        Path(temp_dir),
+                        job_id,
+                        file_folders,
+                        bunkr_status,
+                    )) as downloads:
+                        async for path in downloads:
+                            await handle_downloaded(path)
+
                 else:
-                    async for path in iter_download(
+                    # aclosing() finalizes the generator deterministically
+                    # when handle_downloaded() raises, before the temp
+                    # directory is removed.
+                    async with aclosing(iter_download(
                         link,
                         Path(temp_dir),
                         job_id,
@@ -2618,8 +3290,9 @@ async def worker() -> None:
                         force_dupes,
                         file_delay,
                         file_handles,
-                    ):
-                        await handle_downloaded(path)
+                    )) as downloads:
+                        async for path in downloads:
+                            await handle_downloaded(path)
 
             skipped_total = skipped_count + stats["skipped_pre"]
 
@@ -2642,7 +3315,7 @@ async def worker() -> None:
             log(f"[worker] Job #{job_id} finished successfully.")
 
             # Delete start and success messages after the configured delay.
-            asyncio.create_task(
+            spawn(
                 delete_status(
                     [start_message, done_message],
                     STATUS_DELETE_DELAY,
@@ -2656,7 +3329,7 @@ async def worker() -> None:
             await notify(f"Job #{job_id} cancelled.", topic_id)
 
             # Keep the cancellation message visible.
-            asyncio.create_task(delete_status([start_message], 0))
+            spawn(delete_status([start_message], 0))
 
         except MegaJobAborted as exc:
             finish_job(job_id, error=str(exc))
@@ -2701,7 +3374,7 @@ async def worker() -> None:
                 )
 
             # Keep the error message visible, like other failures.
-            asyncio.create_task(delete_status([start_message], 0))
+            spawn(delete_status([start_message], 0))
 
         except MegaBandwidthLimit as exc:
             # MEGA's bandwidth quota for this IP is exhausted (HTTP
@@ -2749,7 +3422,7 @@ async def worker() -> None:
                 )
 
             # Keep the error message visible, like other failures.
-            asyncio.create_task(delete_status([start_message], 0))
+            spawn(delete_status([start_message], 0))
 
         except Exception as exc:
             error = str(exc) or type(exc).__name__
@@ -2759,7 +3432,7 @@ async def worker() -> None:
             await notify(f"Job #{job_id} failed: {error}", topic_id)
 
             # Keep the error message visible, but remove the start message.
-            asyncio.create_task(delete_status([start_message], 0))
+            spawn(delete_status([start_message], 0))
 
         finally:
             RUNNING.update(job_id=None, process=None, cancel=False)
@@ -2787,6 +3460,8 @@ async def on_mega(event) -> None:
         text = DUPES_REGEX.sub(" ", text)
 
     links = clean_urls(MEGA_REGEX.findall(text))
+    # Bunkr URLs pasted alongside MEGA links share the same queue.
+    links += [f"bk:{url}" for url in bunkr_links_in(text)]
 
     if not links:
         await event.reply(
@@ -2822,7 +3497,7 @@ async def on_mega(event) -> None:
     )
 
     # Delete the acknowledgement after the configured delay.
-    asyncio.create_task(
+    spawn(
         delete_status([acknowledgement], STATUS_DELETE_DELAY)
     )
 
@@ -2857,7 +3532,7 @@ async def on_yt(event) -> None:
     acknowledgement = await event.reply(
         f"Saved {len(urls)} video(s). Pending: {pending}"
     )
-    asyncio.create_task(
+    spawn(
         delete_status([acknowledgement], STATUS_DELETE_DELAY)
     )
 
@@ -2892,7 +3567,63 @@ async def on_nk(event) -> None:
     acknowledgement = await event.reply(
         f"Saved {len(urls)} movie(s). Pending: {pending}"
     )
-    asyncio.create_task(
+    spawn(
+        delete_status([acknowledgement], STATUS_DELETE_DELAY)
+    )
+
+
+@client.on(events.NewMessage(
+    pattern=rf"^{GAP}/(?:bunkr|bk)(?:@\w+)?{GAP}(?:\s|$)"
+))
+async def on_bunkr(event) -> None:
+    """/bunkr <url(s)> [-t topic_id] [-newtopic <name>] [-dupes]."""
+    if not is_allowed(event):
+        return
+
+    text = INVISIBLE_RE.sub("", event.raw_text)
+    log(f"[bunkr] Command from {event.sender_id}: {text!r}")
+
+    force_dupes = bool(DUPES_REGEX.search(text))
+    if force_dupes:
+        text = DUPES_REGEX.sub(" ", text)
+
+    links = bunkr_links_in(text)
+    usage = (
+        "Usage: /bunkr <bunkr-album-or-file-url(s)> [-t topic_id] "
+        "[-newtopic <name>] [-dupes]"
+    )
+    if not links:
+        await event.reply(usage)
+        return
+
+    topic_id, error = await resolve_target_topic(
+        event, text,
+        "Usage: /bunkr <bunkr-url(s)> -newtopic <name> [-dupes]",
+    )
+    if error:
+        await event.reply(error)
+        return
+
+    # Without an explicit target, each album gets its own topic named
+    # after the album title, like MEGA folder topics.
+    auto_folder_topics = (
+        not NEWTOPIC_REGEX.search(text)
+        and not TOPIC_REGEX.search(text)
+        and get_topic_id(event) is None
+    )
+    add_jobs(
+        [f"bk:{url}" for url in links],
+        topic_id,
+        event.sender_id,
+        auto_folder_topics=auto_folder_topics,
+        force_dupes=force_dupes,
+    )
+    _, pending = queue_status()
+
+    acknowledgement = await event.reply(
+        f"Saved {len(links)} Bunkr link(s). Pending: {pending}"
+    )
+    spawn(
         delete_status([acknowledgement], STATUS_DELETE_DELAY)
     )
 
@@ -3032,6 +3763,8 @@ async def on_help(event) -> None:
         "queue MEGA links\n"
         "/yt <url(s)> [-t <topic_id>] [-newtopic <name>] - queue YouTube videos\n"
         "/nk <url(s)> [-t <topic_id>] [-newtopic <name>] - queue Netzkino movies\n"
+        "/bunkr <url(s)> [-t <topic_id>] [-newtopic <name>] [-dupes] - "
+        "queue Bunkr albums/files (alias /bk)\n"
         "/queue - show job progress and pending jobs\n"
         "/cancel [job_id] - cancel the running job or remove a pending one\n"
         "/failed - list recent failed jobs\n"
@@ -3363,6 +4096,22 @@ async def main() -> None:
     else:
         log("[bot] yt-dlp NOT found: /yt and /nk will fail")
 
+    if HAVE_BUNKR_DEPS:
+        log("[bot] requests + beautifulsoup4 found (used for /bunkr)")
+    else:
+        log(
+            "[bot] requests/beautifulsoup4 NOT installed: /bunkr will fail "
+            "(pip install requests beautifulsoup4 lxml)"
+        )
+
+    if shutil.which("ffmpeg"):
+        log("[bot] ffmpeg found (used for 720p video preparation)")
+    else:
+        log(
+            "[bot] ffmpeg NOT found: video jobs will fail during "
+            "preparation and yt-dlp cannot merge streams"
+        )
+
     if not ALLOWED_USERS:
         raise SystemExit(
             "TG_ALLOWED_USERS is empty. The bot would not accept any users."
@@ -3419,10 +4168,41 @@ async def main() -> None:
         log("[bot] Large files: prompt disabled, always split")
 
     await client.start(bot_token=BOT_TOKEN)
-    asyncio.create_task(worker())
+    worker_task = asyncio.create_task(worker())
+
+    # Graceful shutdown on SIGTERM (docker stop) and SIGINT (Ctrl+C):
+    # disconnecting ends run_until_disconnected(), then the worker is
+    # cancelled below. The interrupted job stays 'running' in SQLite
+    # and init_db() puts it back to 'pending' on the next start.
+    loop = asyncio.get_running_loop()
+
+    def request_shutdown(sig_name: str) -> None:
+        log(f"[bot] {sig_name} received, shutting down")
+        spawn(client.disconnect())
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        with suppress(NotImplementedError, RuntimeError):
+            loop.add_signal_handler(sig, request_shutdown, sig.name)
 
     log("Bot is running.")
-    await client.run_until_disconnected()
+    try:
+        await client.run_until_disconnected()
+    finally:
+        # Capture the child process first: the worker's cleanup resets
+        # RUNNING["process"] while it unwinds.
+        process = RUNNING["process"]
+        worker_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await worker_task
+        # Stop blocking download threads (they poll this flag per chunk)
+        # and any downloader/ffmpeg child that is still alive.
+        RUNNING["cancel"] = True
+        if process is not None and process.returncode is None:
+            with suppress(ProcessLookupError):
+                process.terminate()
+        if client.is_connected():
+            await client.disconnect()
+        log("[bot] Shutdown complete")
 
 
 if __name__ == "__main__":

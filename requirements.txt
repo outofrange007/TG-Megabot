@@ -1,5 +1,23 @@
-telethon>=1.34
-pyaes>=1.6
+# Telegram client. >=1.42 provides messages.CreateForumTopicRequest
+# (the script also falls back to the older channels variant); <2 because
+# Telethon 2.x is an incompatible API rewrite.
+telethon>=1.42,<2
+
+# MEGA node/attribute decryption (AES-ECB/CBC); also a Telethon dependency.
+pyaes>=1.6.1,<2
+
+# OpenSSL-backed AES-CTR for fast MEGA file decryption and MAC verification.
 cryptography>=42
-yt-dlp
-Pillow
+
+# Image metadata removal (EXIF/XMP/text chunks) and orientation fixing.
+Pillow>=10.1,<14
+
+# Not imported: invoked as the `yt-dlp` CLI for /yt and /nk. Installing it
+# via pip puts the binary on PATH. Keep it current; extractors break often.
+yt-dlp>=2025.1.1
+
+# Bunkr album/file page scraping and CDN downloads for /bunkr.
+requests>=2.31.0
+beautifulsoup4>=4.12.0
+# Fast HTML parser for BeautifulSoup (falls back to html.parser if absent).
+lxml>=4.9.0
