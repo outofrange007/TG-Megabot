@@ -8,6 +8,7 @@ import re
 import shutil
 import signal
 import sqlite3
+import subprocess
 import tempfile
 import time
 import urllib.error
@@ -2964,12 +2965,97 @@ def prepare_image_for_telegram(path: Path) -> Path:
     return target
 
 
-async def prepare_video_for_telegram(path: Path) -> Path:
-    """Encode H.264/AAC MP4 with faststart inside an oriented 720p box.
+def _probe_video(path: Path) -> dict:
+    """Return basic codec/geometry info for a video file via ffprobe.
 
-    Landscape: at most 1280x720. Portrait: at most 720x1280.
-    FFmpeg applies source rotation before scaling. Smaller videos are not
-    enlarged. Always encode to enforce the limit consistently across codecs.
+    Keys returned: video_codec, pix_fmt, width, height, audio_codec.
+    Any value that cannot be determined is None.  An empty dict is returned
+    when ffprobe is unavailable or exits with a non-zero status.
+    """
+    if not shutil.which("ffprobe"):
+        return {}
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe", "-v", "quiet",
+                "-print_format", "json",
+                "-show_streams",
+                str(path),
+            ],
+            capture_output=True,
+            timeout=30,
+        )
+        if result.returncode != 0:
+            return {}
+        data = json.loads(result.stdout)
+    except Exception:
+        return {}
+
+    info: dict = {
+        "video_codec": None,
+        "pix_fmt": None,
+        "width": None,
+        "height": None,
+        "audio_codec": None,
+    }
+    for stream in data.get("streams", []):
+        codec_type = stream.get("codec_type")
+        if codec_type == "video" and info["video_codec"] is None:
+            info["video_codec"] = stream.get("codec_name")
+            info["pix_fmt"] = stream.get("pix_fmt")
+            info["width"] = stream.get("width")
+            info["height"] = stream.get("height")
+        elif codec_type == "audio" and info["audio_codec"] is None:
+            info["audio_codec"] = stream.get("codec_name")
+    return info
+
+
+def _needs_reencode(info: dict) -> bool:
+    """Return True when the video must be transcoded for Telegram delivery.
+
+    Stream-copy (remux only) is sufficient when ALL of the following hold:
+      - Video codec is H.264
+      - Pixel format is yuv420p  (required by all H.264 Baseline/Main profiles)
+      - Fits inside the oriented 720p box:
+            landscape  → width ≤ 1280 and height ≤ 720
+            portrait   → width ≤ 720  and height ≤ 1280
+        (equivalent: long edge ≤ 1280 and short edge ≤ 720)
+      - Audio codec is AAC or no audio track is present
+
+    An empty info dict (probe failed) is treated as "must re-encode" so that
+    the safe path is always taken when metadata cannot be read.
+    """
+    if not info:
+        return True
+
+    codec = info.get("video_codec")
+    pix = info.get("pix_fmt")
+    w = info.get("width") or 0
+    h = info.get("height") or 0
+    audio = info.get("audio_codec")
+
+    if codec != "h264" or pix != "yuv420p":
+        return True
+    long_edge = max(w, h)
+    short_edge = min(w, h)
+    if long_edge > 1280 or short_edge > 720:
+        return True
+    if audio is not None and audio != "aac":
+        return True
+    return False
+
+
+async def prepare_video_for_telegram(path: Path) -> Path:
+    """Prepare a video for Telegram upload within a 720p H.264/AAC envelope.
+
+    If the file is already H.264/yuv420p/AAC and fits inside the 720p box,
+    only a fast remux is performed (stream copy + faststart + metadata strip).
+    Otherwise the video is fully transcoded to libx264 CRF 26, AAC 128k and
+    scaled to at most 1280×720 (landscape) / 720×1280 (portrait).
+
+    Landscape box: at most 1280×720.  Portrait box: at most 720×1280.
+    FFmpeg applies stored rotation metadata before scaling when re-encoding.
+    Smaller-than-box videos are never enlarged.
     """
     if path.suffix.lower() not in VIDEO_EXTENSIONS:
         return path
@@ -2990,7 +3076,38 @@ async def prepare_video_for_telegram(path: Path) -> Path:
         "h='if(gte(iw,ih),min(ih,720),min(ih,1280))':"
         "force_original_aspect_ratio=decrease:force_divisible_by=2"
     )
-    log(f"[opt] Encoding {path.name} to maximum 720p H.264/AAC + faststart")
+
+    # Probe the file and decide whether a full re-encode is needed.
+    probe = await asyncio.to_thread(_probe_video, path)
+    reencode = _needs_reencode(probe)
+
+    if reencode:
+        log(f"[opt] Re-encoding {path.name} → 720p H.264/AAC + faststart "
+            f"(codec={probe.get('video_codec')}, "
+            f"pix={probe.get('pix_fmt')}, "
+            f"{probe.get('width')}×{probe.get('height')}, "
+            f"audio={probe.get('audio_codec')})")
+        ffmpeg_cmd = [
+            "ffmpeg", "-hide_banner", "-loglevel", "error",
+            "-nostdin", "-y", "-i", str(path),
+            "-map", "0:V:0", "-map", "0:a:0?",
+            "-map_metadata", "-1", "-map_chapters", "-1",
+            "-vf", scale_filter,
+            "-c:v", "libx264", "-preset", "slow", "-crf", "26",
+            "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "128k",
+            "-movflags", "+faststart",
+        ]
+    else:
+        log(f"[opt] Remuxing {path.name} (already 720p H.264/AAC) + faststart")
+        ffmpeg_cmd = [
+            "ffmpeg", "-hide_banner", "-loglevel", "error",
+            "-nostdin", "-y", "-i", str(path),
+            "-map", "0:V:0", "-map", "0:a:0?",
+            "-map_metadata", "-1", "-map_chapters", "-1",
+            "-c", "copy",
+            "-movflags", "+faststart",
+        ]
 
     with tempfile.TemporaryDirectory(
         prefix="video-720p-", dir=str(path.parent)
@@ -2998,15 +3115,7 @@ async def prepare_video_for_telegram(path: Path) -> Path:
         output = Path(temporary) / "prepared.mp4"
         with tempfile.TemporaryFile() as error_log:
             process = await asyncio.create_subprocess_exec(
-                "ffmpeg", "-hide_banner", "-loglevel", "error",
-                "-nostdin", "-y", "-i", str(path),
-                "-map", "0:V:0", "-map", "0:a:0?",
-                "-map_metadata", "-1", "-map_chapters", "-1",
-                "-vf", scale_filter,
-                "-c:v", "libx264", "-preset", "slow", "-crf", "26",
-                "-pix_fmt", "yuv420p",
-                "-c:a", "aac", "-b:a", "128k",
-                "-movflags", "+faststart", str(output),
+                *ffmpeg_cmd, str(output),
                 stdout=asyncio.subprocess.DEVNULL, stderr=error_log,
             )
             RUNNING["process"] = process
@@ -3032,8 +3141,9 @@ async def prepare_video_for_telegram(path: Path) -> Path:
                     length = error_log.tell()
                     error_log.seek(max(0, length - 4000))
                     detail = error_log.read().decode("utf-8", errors="replace")
+                    action = "Re-encoding" if reencode else "Remux"
                     raise RuntimeError(
-                        f"720p conversion failed for {path.name}: {detail.strip()}"
+                        f"{action} failed for {path.name}: {detail.strip()}"
                     )
             finally:
                 if process.returncode is None:
@@ -3055,13 +3165,14 @@ async def prepare_video_for_telegram(path: Path) -> Path:
                     RUNNING["process"] = None
 
         if not output.is_file() or not output.stat().st_size:
-            raise RuntimeError(f"FFmpeg produced no video: {path.name}")
+            raise RuntimeError(f"FFmpeg produced no output for: {path.name}")
         output.replace(target)
 
     if target != path:
         path.unlink(missing_ok=True)
+    action_label = "Re-encoded" if reencode else "Remuxed"
     log(
-        f"[opt] Video ready: {target.name} "
+        f"[opt] {action_label}: {target.name} "
         f"({format_size(target.stat().st_size)})"
     )
     return target
