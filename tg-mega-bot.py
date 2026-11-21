@@ -1702,18 +1702,44 @@ def make_progress_logger(name: str):
     return callback
 
 
+from telethon.errors import (
+    PhotoInvalidDimensionsError,
+    PhotoSaveFileInvalidError,
+    ImageProcessFailedError,
+    MediaInvalidError,
+)
+
 async def send_file(path: Path, topic_id: int | None, progress=None) -> None:
-    """Upload one file without a caption. Telegram detects the media type."""
-    await client.send_file(
-        CHAT_ID,
-        str(path),
-        force_document=False,
-        # MP4 videos get the streaming flag so Telegram offers instant
-        # playback instead of a plain file download.
-        supports_streaming=True,
-        reply_to=topic_id,
-        progress=progress,
-    )
+    """Upload one file without a caption.
+
+    Telegram detects the media type. If Telegram refuses to process the file
+    as a photo or video, retry once as a plain document so the job continues.
+    """
+    try:
+        await client.send_file(
+            CHAT_ID,
+            str(path),
+            force_document=False,
+            reply_to=topic_id,
+            progress=progress,
+        )
+    except (
+        PhotoInvalidDimensionsError,
+        PhotoSaveFileInvalidError,
+        ImageProcessFailedError,
+        MediaInvalidError,
+    ) as error:
+        log(
+            f"[ul] Telegram rejected {path.name} as media "
+            f"({type(error).__name__}); retrying as document"
+        )
+        await client.send_file(
+            CHAT_ID,
+            str(path),
+            force_document=True,
+            reply_to=topic_id,
+            progress=progress,
+        )
 
 
 # ---- Large-file prompt ----
