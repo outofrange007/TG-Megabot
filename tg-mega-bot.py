@@ -15,6 +15,7 @@ import urllib.request
 from contextlib import closing
 from pathlib import Path
 
+from PIL import Image, ImageOps
 from telethon import TelegramClient, events, Button
 from telethon.tl.functions.messages import (
     CreateForumTopicRequest,
@@ -1019,10 +1020,10 @@ def mega_api(body: list, handle: str | None = None) -> dict:
                 ):
                     delay = 2 * attempt
                     log(
-                        f"[mega] API error {first} "
-                        f"({MEGA_API_ERRORS.get(first, 'unknown')}); "
-                        f"retrying in {delay}s "
-                        f"({attempt + 1}/{MEGA_API_RETRIES})"
+                    f"[mega] API error {first} "
+                    f"({MEGA_API_ERRORS.get(first, 'unknown')}); "
+                    f"retrying in {delay}s "
+                    f"({attempt + 1}/{MEGA_API_RETRIES})"
                     )
                     time.sleep(delay)
                     continue
@@ -1682,22 +1683,39 @@ def write_part(src: Path, dst: Path, index: int) -> None:
 
 
 def make_progress_logger(name: str):
-    """Return a Telethon progress callback that logs every 10 percent."""
-    last_percent = 0
+    """Log upload percentage, bytes and average speed at timed intervals."""
+    started = time.monotonic()
+    last_logged = started
+    last_current = 0
+    completed = False
 
     def callback(current: int, total: int) -> None:
-        # Raising inside the callback aborts the upload.
+        nonlocal started, last_logged, last_current, completed
         if RUNNING["cancel"]:
             raise JobCancelled()
 
-        nonlocal last_percent
-        percent = int(current / total * 100) if total else 100
-        if percent >= last_percent + 10:
-            last_percent = percent
-            log(
-                f"[ul] {name}: {percent}% "
-                f"({format_size(current)} of {format_size(total)})"
-            )
+        now = time.monotonic()
+        if current < last_current:
+            started = now
+            last_logged = now
+            completed = False
+        last_current = current
+        finished = total > 0 and current >= total
+        if completed and finished:
+            return
+        if not finished and now - last_logged < PROGRESS_INTERVAL:
+            return
+
+        speed = current / max(now - started, 0.001)
+        percent = min(current / total * 100, 100.0) if total else 0.0
+        total_text = format_size(total) if total else "unknown"
+        log(
+            f"[ul] {name}: {percent:.1f}% "
+            f"({format_size(current)} of {total_text}, "
+            f"{format_size(speed)}/s)"
+        )
+        last_logged = now
+        completed = finished
 
     return callback
 
@@ -1710,18 +1728,17 @@ from telethon.errors import (
 )
 
 async def send_file(path: Path, topic_id: int | None, progress=None) -> None:
-    """Upload one file without a caption.
-
-    Telegram detects the media type. If Telegram refuses to process the file
-    as a photo or video, retry once as a plain document so the job continues.
-    """
+    """Send prepared media; retry Telegram processing errors as a document."""
+    if RUNNING["cancel"]:
+        raise JobCancelled()
     try:
         await client.send_file(
             CHAT_ID,
             str(path),
             force_document=False,
+            supports_streaming=path.suffix.lower() == ".mp4",
             reply_to=topic_id,
-            progress=progress,
+            progress_callback=progress,
         )
     except (
         PhotoInvalidDimensionsError,
@@ -1729,16 +1746,18 @@ async def send_file(path: Path, topic_id: int | None, progress=None) -> None:
         ImageProcessFailedError,
         MediaInvalidError,
     ) as error:
+        if RUNNING["cancel"]:
+            raise JobCancelled()
         log(
             f"[ul] Telegram rejected {path.name} as media "
-            f"({type(error).__name__}); retrying as document"
+            f"({type(error).__name__}); retrying prepared file as document"
         )
         await client.send_file(
             CHAT_ID,
             str(path),
             force_document=True,
             reply_to=topic_id,
-            progress=progress,
+            progress_callback=make_progress_logger(path.name),
         )
 
 
@@ -2253,167 +2272,211 @@ async def delete_status(messages: list, delay: int) -> None:
         print(f"Message deletion failed: {exc}", flush=True)
 
 
-# ---- Video preparation for Telegram ----
-# Telegram streams videos best from MP4 files (H.264/AAC) whose index
-# sits at the front of the file ("faststart"). Every downloaded video
-# is therefore normalized before it is uploaded:
-#
-#   .mp4/.m4v/.mov    repacked with faststart; streams are copied.
-#   other containers  remuxed into MP4 (stream copy: fast, lossless).
-#
-# Codecs Telegram cannot play trigger a conversion: first only the
-# audio track is converted to AAC (the video stream is kept), and if
-# the video codec itself is unsupported (DivX, MPEG2, VP9, ...) the
-# whole video is re-encoded to H.264/AAC, which is slow. Non-video
-# files, and any video FFmpeg cannot process, are uploaded unchanged.
-# Set VIDEO_REENCODE=0 to disable the slow full re-encode.
+# ---- Local media preparation for Telegram ----
+# Hashes are computed before preparation. Animated images bypass cleaning.
+# Preparation errors abort the job rather than uploading uncleaned static
+# images or videos that do not meet the requested resolution limit.
+IMAGE_EXTENSIONS = {
+    ".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff", ".gif",
+}
 VIDEO_EXTENSIONS = {
     ".mp4", ".m4v", ".mov", ".mkv", ".avi", ".webm", ".wmv", ".flv",
     ".mpg", ".mpeg", ".ts", ".m2ts", ".3gp", ".ogv", ".vob",
 }
-FASTSTART_EXTENSIONS = {".mp4"}
 VIDEO_REENCODE = (
     os.environ.get("VIDEO_REENCODE", "1").strip().lower()
     not in ("0", "false", "no")
 )
-
-# Seconds per FFmpeg run before it is killed and the original file is
-# uploaded unchanged instead.
 FFMPEG_TIMEOUT = 7200
 
 
-def probe_video_codecs(path: Path) -> tuple[bool, bool]:
-    """Check with ffprobe whether a video's codecs are Telegram-friendly.
-
-    Returns (video_ok, audio_ok); ok means every stream of that kind
-    can be copied into an MP4 that Telegram plays. A file without an
-    audio stream counts as audio_ok, and any probe problem counts as
-    ok so the caller simply tries the lossless remux first.
-    """
-    command = [
-        "ffprobe", "-v", "error",
-        "-show_entries", "stream=codec_type,codec_name",
-        "-of", "json", str(path),
-    ]
-    try:
-        result = subprocess.run(
-            command, check=True, capture_output=True, timeout=60
-        )
-        streams = json.loads(result.stdout).get("streams", [])
-    except Exception as error:
-        log(f"[opt] Could not probe {path.name}: {error}")
-        return True, True
-
-    video_ok, audio_ok = True, True
-    for stream in streams:
-        if stream.get("disposition", {}).get("attached_pic"):
-            continue  # cover art, not a real video stream
-        codec = stream.get("codec_name", "")
-        if stream.get("codec_type") == "video":
-            video_ok = video_ok and codec in ("h264", "hevc", "h265")
-        elif stream.get("codec_type") == "audio":
-            audio_ok = audio_ok and codec in ("aac", "mp3")
-    return video_ok, audio_ok
+def media_target(path: Path, suffix: str) -> Path:
+    """Keep the original name when possible, without overwriting siblings."""
+    if path.suffix.lower() == suffix and path.suffix == suffix:
+        return path
+    target = path.with_suffix(suffix)
+    counter = 1
+    while target.exists():
+        target = path.with_name(f"{path.stem}_{counter}{suffix}")
+        counter += 1
+    return target
 
 
-def _run_ffmpeg(command: list[str], what: str) -> bool:
-    """Run one FFmpeg command; return True on success.
+def prepare_image_for_telegram(path: Path) -> Path:
+    """Apply EXIF orientation and save static pixels without source metadata."""
+    if path.suffix.lower() not in IMAGE_EXTENSIONS:
+        return path
+    if RUNNING["cancel"]:
+        raise JobCancelled()
 
-    The last element of the command must be the output file; it is
-    removed again when the run fails or writes nothing.
-    """
-    try:
-        log(f"[opt] {what}")
-        subprocess.run(command, check=True, timeout=FFMPEG_TIMEOUT)
-        if not os.path.getsize(command[-1]):
-            raise RuntimeError("no output was written")
-        return True
-    except Exception as error:
-        log(f"[opt] {what} failed: {error}")
-        Path(command[-1]).unlink(missing_ok=True)
-        return False
+    suffix = path.suffix.lower()
+    if suffix not in {".jpg", ".jpeg", ".png", ".webp"}:
+        suffix = ".png"
+    target = media_target(path, suffix)
+
+    with Image.open(path) as image:
+        if getattr(image, "is_animated", False):
+            log(f"[opt] Animated image left unchanged: {path.name}")
+            return path
+        if getattr(image, "n_frames", 1) > 1:
+            log(f"[opt] Multi-frame image left unchanged: {path.name}")
+            return path
+        image.load()
+        oriented = ImageOps.exif_transpose(image)
+        try:
+            has_alpha = (
+                "A" in oriented.getbands() or "transparency" in oriented.info
+            )
+            mode = "RGBA" if has_alpha else "RGB"
+            with oriented.convert(mode) as pixels:
+                with Image.new(mode, pixels.size) as clean:
+                    clean.paste(pixels)
+                    clean.info.clear()
+                    with tempfile.TemporaryDirectory(
+                        prefix="image-clean-", dir=str(path.parent)
+                    ) as temporary:
+                        output = Path(temporary) / ("clean" + suffix)
+                        if suffix in {".jpg", ".jpeg"}:
+                            with Image.new("RGB", clean.size, "white") as rgb:
+                                if mode == "RGBA":
+                                    with clean.getchannel("A") as alpha:
+                                        rgb.paste(clean, mask=alpha)
+                                else:
+                                    rgb.paste(clean)
+                                rgb.save(
+                                    output, format="JPEG", quality=95,
+                                    optimize=True, progressive=True, exif=b"",
+                                )
+                        elif suffix == ".webp":
+                            clean.save(
+                                output, format="WEBP", quality=90,
+                                method=6, exif=b"", xmp=b"",
+                            )
+                        else:
+                            clean.save(output, format="PNG", optimize=True)
+                        with Image.open(output) as check:
+                            check.load()
+                            if check.getexif() or check.info.get("exif"):
+                                raise RuntimeError(
+                                    f"EXIF removal verification failed: {path.name}"
+                                )
+                        if RUNNING["cancel"]:
+                            raise JobCancelled()
+                        output.replace(target)
+        finally:
+            if oriented is not image:
+                oriented.close()
+
+    if target != path:
+        path.unlink(missing_ok=True)
+    log(
+        f"[opt] Image metadata removed: {target.name} "
+        f"({format_size(target.stat().st_size)})"
+    )
+    return target
 
 
-def prepare_video_for_telegram(path: Path) -> Path:
-    """Bring one video into Telegram's preferred form: MP4 + faststart.
+async def prepare_video_for_telegram(path: Path) -> Path:
+    """Encode H.264/AAC MP4 with faststart inside an oriented 720p box.
 
-    Returns the path to upload. On success the original download is
-    consumed (replaced in place, or renamed to .mp4); on any problem
-    the input path is returned unchanged so the upload proceeds with
-    the original file.
+    Landscape: at most 1280x720. Portrait: at most 720x1280.
+    FFmpeg applies source rotation before scaling. Smaller videos are not
+    enlarged. Always encode to enforce the limit consistently across codecs.
     """
     if path.suffix.lower() not in VIDEO_EXTENSIONS:
         return path
-
+    if RUNNING["cancel"]:
+        raise JobCancelled()
+    if not VIDEO_REENCODE:
+        raise RuntimeError(
+            "VIDEO_REENCODE=0 conflicts with mandatory 720p preparation; "
+            "set VIDEO_REENCODE=1"
+        )
     if not shutil.which("ffmpeg"):
-        log(f"[opt] FFmpeg not found; leaving {path.name} unchanged")
-        return path
+        raise RuntimeError("FFmpeg is required for 720p video preparation")
 
-    # The MP4 family keeps its name; every other container becomes
-    # .mp4 so Telegram always receives a real MP4 video.
-    is_mp4 = path.suffix.lower() in FASTSTART_EXTENSIONS
-    if is_mp4:
-        target = path
-    else:
-        target = path.with_suffix(".mp4")
-        counter = 1
-        while target.exists():
-            target = path.with_name(f"{path.stem}_{counter}.mp4")
-            counter += 1
+    target = media_target(path, ".mp4")
+    scale_filter = (
+        "scale="
+        "w='if(gte(iw,ih),min(iw,1280),min(iw,720))':"
+        "h='if(gte(iw,ih),min(ih,720),min(ih,1280))':"
+        "force_original_aspect_ratio=decrease:force_divisible_by=2"
+    )
+    log(f"[opt] Encoding {path.name} to maximum 720p H.264/AAC + faststart")
 
-    # FFmpeg always writes a sibling temp file first, so a failed run
-    # can never destroy the downloaded original.
-    output = path.with_name(f"{path.stem}.opt.mp4")
-
-    video_ok, audio_ok = probe_video_codecs(path)
-    attempts: list[tuple[str, list[str]]] = []
-
-    if video_ok and audio_ok:
-        # All codecs are Telegram-friendly: a pure remux suffices
-        # (faststart for MP4 sources, a container change otherwise).
-        attempts.append((
-            f"Repacking {path.name} with faststart" if is_mp4
-            else f"Converting {path.name} to MP4 (stream copy)",
-            ["-c", "copy", "-movflags", "+faststart"],
-        ))
-
-    if video_ok and not audio_ok:
-        # Video is fine, the audio is not (DTS, Opus, ...): keep the
-        # video stream and convert the audio only.
-        attempts.append((
-            f"Converting the audio of {path.name} to AAC",
-            ["-c:v", "copy", "-c:a", "aac", "-b:a", "160k",
-             "-movflags", "+faststart"],
-        ))
-
-    if not video_ok and VIDEO_REENCODE:
-        # Unsupported video codec (DivX, MPEG2, VP9, ...): a full
-        # re-encode also fixes the audio in the same pass.
-        attempts.append((
-            f"Re-encoding {path.name} to H.264/AAC (this is slow)",
-            ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
-             "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart"],
-        ))
-
-    for what, codec_args in attempts:
-        # Subtitles and data streams cannot live in an MP4 and would
-        # abort the remux of typical MKVs, so they are dropped.
-        command = [
-            "ffmpeg", "-y", "-nostdin", "-i", str(path), *codec_args,
-            "-sn", "-dn", "-loglevel", "error", str(output),
-        ]
-        if _run_ffmpeg(command, what):
-            output.replace(target)
-            if target is not path:
-                path.unlink(missing_ok=True)
-            log(
-                f"[opt] {target.name} ready "
-                f"({format_size(target.stat().st_size)})"
+    with tempfile.TemporaryDirectory(
+        prefix="video-720p-", dir=str(path.parent)
+    ) as temporary:
+        output = Path(temporary) / "prepared.mp4"
+        with tempfile.TemporaryFile() as error_log:
+            process = await asyncio.create_subprocess_exec(
+                "ffmpeg", "-hide_banner", "-loglevel", "error",
+                "-nostdin", "-y", "-i", str(path),
+                "-map", "0:V:0", "-map", "0:a:0?",
+                "-map_metadata", "-1", "-map_chapters", "-1",
+                "-vf", scale_filter,
+                "-c:v", "libx264", "-preset", "slow", "-crf", "26",
+                "-pix_fmt", "yuv420p",
+                "-c:a", "aac", "-b:a", "128k",
+                "-movflags", "+faststart", str(output),
+                stdout=asyncio.subprocess.DEVNULL, stderr=error_log,
             )
-            return target
+            RUNNING["process"] = process
+            wait_task = asyncio.create_task(process.wait())
+            started = time.monotonic()
+            try:
+                while not wait_task.done():
+                    if RUNNING["cancel"]:
+                        raise JobCancelled()
+                    if time.monotonic() - started > FFMPEG_TIMEOUT:
+                        raise RuntimeError(f"FFmpeg timed out: {path.name}")
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.shield(wait_task), timeout=1
+                        )
+                    except asyncio.TimeoutError:
+                        pass
+                await wait_task
+                if RUNNING["cancel"]:
+                    raise JobCancelled()
+                if process.returncode:
+                    error_log.seek(0, os.SEEK_END)
+                    length = error_log.tell()
+                    error_log.seek(max(0, length - 4000))
+                    detail = error_log.read().decode("utf-8", errors="replace")
+                    raise RuntimeError(
+                        f"720p conversion failed for {path.name}: {detail.strip()}"
+                    )
+            finally:
+                if process.returncode is None:
+                    try:
+                        process.terminate()
+                    except ProcessLookupError:
+                        pass
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.shield(wait_task), timeout=5
+                        )
+                    except asyncio.TimeoutError:
+                        try:
+                            process.kill()
+                        except ProcessLookupError:
+                            pass
+                        await wait_task
+                if RUNNING["process"] is process:
+                    RUNNING["process"] = None
 
-    log(f"[opt] Leaving {path.name} unchanged")
-    return path
+        if not output.is_file() or not output.stat().st_size:
+            raise RuntimeError(f"FFmpeg produced no video: {path.name}")
+        output.replace(target)
+
+    if target != path:
+        path.unlink(missing_ok=True)
+    log(
+        f"[opt] Video ready: {target.name} "
+        f"({format_size(target.stat().st_size)})"
+    )
+    return target
 
 
 # ---- Queue worker ----
@@ -2464,45 +2527,40 @@ async def worker() -> None:
             folder_topics: dict[str, int] = {}
 
             async def handle_downloaded(path: Path) -> None:
-                """Dedup-check, optimize and upload one downloaded file."""
+                """Dedup-check the original, prepare locally, then upload."""
                 nonlocal file_count, kept_count, skipped_count
-
+                if RUNNING["cancel"]:
+                    raise JobCancelled()
                 hash_value = await asyncio.to_thread(file_hash, path)
 
-                # -dupes re-sends files the registry already knows.
+                # Store the original hash, name and size, never the encoded
+                # output, so existing duplicate records remain compatible.
                 if not force_dupes and seen_file(hash_value):
                     skipped_count += 1
                     JOB_PROGRESS[job_id]["skipped"] += 1
                     mark_skipped(
-                        path.name,
-                        path.stat().st_size,
-                        "hash",
-                        job_id,
+                        path.name, path.stat().st_size, "hash", job_id,
                     )
                     log(
                         f"[worker] Job #{job_id}: duplicate skipped: "
                         f"{path.name} ({hash_value[:16]}...)"
                     )
+                    file_folders.pop(str(path), None)
+                    file_handles.pop(str(path), None)
                     path.unlink(missing_ok=True)
                     return
 
-                # Name and size of the original download go into the
-                # duplicate registry, so it keeps matching the source
-                # file even when the upload is converted (MKV to MP4).
                 original_name = path.name
                 original_size = path.stat().st_size
-
-                # Topic routing is keyed by the original download path;
-                # look the folder up before the video conversion can
-                # rename the file.
                 folder_name = file_folders.pop(str(path), None)
                 node_handle = file_handles.pop(str(path), None)
 
-                # Normalize videos for Telegram (MP4 with faststart);
-                # a no-op for other file types or without FFmpeg.
                 upload_path = await asyncio.to_thread(
-                    prepare_video_for_telegram, path
+                    prepare_image_for_telegram, path
                 )
+                upload_path = await prepare_video_for_telegram(upload_path)
+                if RUNNING["cancel"]:
+                    raise JobCancelled()
 
                 file_topic_id = topic_id
                 if auto_folder_topics and folder_name:
@@ -2516,23 +2574,18 @@ async def worker() -> None:
                             f"'{folder_name}': {exc}"
                         ) from exc
 
+                # Size checks and splitting apply to the prepared file.
                 if await upload_one(upload_path, file_topic_id):
                     file_count += 1
                     JOB_PROGRESS[job_id]["uploaded"] = file_count
                     mark_seen(
-                        hash_value,
-                        original_name,
-                        original_size,
-                        job_id,
-                        node_handle,
+                        hash_value, original_name, original_size,
+                        job_id, node_handle,
                     )
                     upload_path.unlink(missing_ok=True)
                     log(f"[worker] Job #{job_id}: uploaded {upload_path.name}")
                 else:
-                    # Kept on the server: not sent, so it stays
-                    # unrecorded in the duplicate registry and the same
-                    # link queued again will be downloaded and asked
-                    # about again instead of being skipped.
+                    # Retained files are not recorded as uploaded.
                     kept_count += 1
                     JOB_PROGRESS[job_id]["kept"] = kept_count
                     log(
@@ -2544,22 +2597,18 @@ async def worker() -> None:
                 log(f"[worker] Job #{job_id} using temp dir {temp_dir}")
 
                 if link.startswith("yt:"):
-                    # YouTube video(s) via yt-dlp.
                     for path in await run_ytdlp(
                         link[3:], Path(temp_dir), YT_MAX_SIZE
                     ):
                         await handle_downloaded(path)
 
                 elif link.startswith("nk:"):
-                    # Netzkino movie via yt-dlp (built-in extractor).
                     for path in await run_ytdlp(
                         link[3:], Path(temp_dir), NZ_MAX_SIZE
                     ):
                         await handle_downloaded(path)
 
                 else:
-                    # MEGA: download and upload overlap file by file,
-                    # so disk usage stays bounded by the largest file.
                     async for path in iter_download(
                         link,
                         Path(temp_dir),
