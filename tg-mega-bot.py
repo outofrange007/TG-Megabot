@@ -278,8 +278,424 @@ BUNKR_FILE_DELAY = env_float("BUNKR_FILE_DELAY", 1.0)
 
 # Queued jobs are prefixed with their source so the worker can pick the
 # right downloader: "yt:<url>" for YouTube, "nk:<url>" for Netzkino,
-# "bk:<url>" for Bunkr albums/files and unprefixed MEGA links (the
-# original format).
+# "bk:<url>" for Bunkr albums/files, "cm:<url>" for Coomer profiles/posts
+# and unprefixed MEGA links (the original format).
+
+# ---- Coomer configuration ----
+# Known Coomer site domains. Profile pages live at /<service>/user/<name>,
+# single posts at /<service>/user/<name>/<post_id> (e.g. /onlyfans/user/
+# katjakrasavice). Coomer moves to new TLDs often, so any coomer.<tld>
+# host is accepted and a new mirror works without a code change.
+COOMER_DOMAINS = {'coomer.st', 'coomer.su', 'coomer.pet'}
+COOMER_DOMAIN_REGEX = re.compile(r'(?:^|\.)coomer\.[a-z]{2,12}$')
+# Candidate URLs in a message; the host is checked afterwards.
+COOMER_URL_REGEX = re.compile(
+    r'https?://[\w.-]+/[a-z]+/user/[\w.-]+(?:/\d+)?',
+    re.IGNORECASE,
+)
+COOMER_USER_AGENT = (
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+    '(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
+)
+# Back-off before retry 1, 2 and 3 after HTTP 429, 5xx or a connection error.
+COOMER_RETRY_DELAYS = (10, 30, 60)
+# (connect, read) timeouts in seconds for Coomer API and CDN requests.
+COOMER_TIMEOUT = (15, 60)
+# Streaming download chunk size.
+COOMER_CHUNK = 8192
+# Pause between two files of a profile, to stay below rate limits.
+COOMER_FILE_DELAY = env_float('COOMER_FILE_DELAY', 1.0)
+# Safety cap for how many posts of a profile are scanned (0 = all).
+COOMER_MAX_POSTS = int(env_float('COOMER_MAX_POSTS', 0))
+# Page size of the posts endpoint; the server caps it at 50 per page.
+COOMER_PAGE_SIZE = 50
+
+
+class CoomerError(RuntimeError):
+    """A Coomer profile page or file could not be fetched or parsed."""
+
+
+def _coomer_host(url: str) -> str:
+    """Return the lowercased host of a Coomer URL."""
+    return urlsplit(url).hostname.lower() if urlsplit(url).hostname else ''
+
+
+def is_coomer_url(url: str) -> bool:
+    """Return True when the URL's host is a Coomer site domain."""
+    host = _coomer_host(url)
+    return host in COOMER_DOMAINS or bool(COOMER_DOMAIN_REGEX.search(host))
+
+
+def coomer_links_in(text: str) -> list[str]:
+    """Return the Coomer profile/post URLs contained in a message text."""
+    urls = []
+    for url in clean_urls(COOMER_URL_REGEX.findall(text)):
+        if is_coomer_url(url) and parse_coomer_link(url) is not None:
+            urls.append(url)
+    return urls
+
+
+def parse_coomer_link(url: str):
+    """Split a Coomer URL into (kind, service, user, post_id).
+
+    kind is 'profile' for /<service>/user/<name> links and 'post' for
+    /<service>/user/<name>/<post_id> links. Returns None for anything
+    that is not a profile or post page (index, search, static files).
+    """
+    parts = urlsplit(url)
+    if parts.scheme not in ('http', 'https'):
+        return None
+    segments = [s for s in parts.path.split('/') if s]
+    if len(segments) >= 3 and segments[1].lower() == 'user':
+        service = segments[0].lower()
+        user = segments[2]
+        if not re.match(r'^[a-z][\w-]*$', service):
+            return None
+        if len(segments) == 3:
+            return ('profile', service, user, None)
+        if len(segments) == 4 and segments[3].isdigit():
+            return ('post', service, user, segments[3])
+    return None
+
+
+def coomer_session():
+    """Build a requests session that passes Coomer's bot checks.
+
+    Coomer (like Kemono) rejects JSON requests from plain clients with
+    HTTP 403 unless they send an Accept header a browser would not use
+    for JSON, so every API request goes out with 'Accept: text/css'.
+    """
+    if not HAVE_BUNKR_DEPS:
+        raise CoomerError(
+            'Coomer support needs the requests package: pip install requests'
+        )
+    session = requests.Session()
+    session.headers.update({
+        'User-Agent': COOMER_USER_AGENT,
+        'Accept': 'text/css',
+    })
+    return session
+
+
+def _coomer_sleep(seconds: float) -> None:
+    """Sleep in 0.5 s slices so a cancel takes effect quickly."""
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if RUNNING['cancel']:
+            raise JobCancelled()
+        time.sleep(0.5)
+
+
+def coomer_request(session, url: str, params=None, what: str = 'page'):
+    """GET a Coomer URL, retrying on HTTP 429, 5xx and connection errors.
+
+    Returns the response even on HTTP 400: the posts endpoint signals
+    'no more pages' with 400, which the caller treats as the end.
+    Raises CoomerError for other HTTP errors or after all retries.
+    """
+    attempts = len(COOMER_RETRY_DELAYS) + 1
+    for attempt in range(attempts):
+        try:
+            response = session.get(
+                url,
+                params=params,
+                timeout=COOMER_TIMEOUT,
+                allow_redirects=True,
+            )
+        except requests.RequestException as exc:
+            reason = str(exc) or type(exc).__name__
+            if attempt == attempts - 1:
+                raise CoomerError(
+                    f'Coomer {what} {url} failed after {attempts} attempts: '
+                    f'{reason}'
+                ) from exc
+            delay = COOMER_RETRY_DELAYS[attempt]
+            log(f'[coomer] {what} {url}: {reason} - retry in {delay}s')
+            _coomer_sleep(delay)
+            continue
+
+        status = response.status_code
+        if status in (200, 400):
+            return response
+        reason = response.reason or ''
+        if status in (403, 404):
+            raise CoomerError(
+                f'HTTP {status} for Coomer {what} {url}: {reason}'
+            )
+        if attempt == attempts - 1:
+            raise CoomerError(f'HTTP {status} for Coomer {what} {url}: {reason}')
+        delay = COOMER_RETRY_DELAYS[attempt]
+        log(f'[coomer] {what} {url}: HTTP {status} - retry in {delay}s')
+        _coomer_sleep(delay)
+    raise CoomerError(f'Giving up on Coomer {what} {url}')
+
+
+def _coomer_api_base(url: str) -> str:
+    """Return the https base (scheme + host) of a Coomer site URL."""
+    parts = urlsplit(url)
+    return f'{parts.scheme or "https"}://{parts.netloc}'
+
+
+def parse_coomer_media(items: list, seen: set[str]) -> list[tuple[str, str]]:
+    """Extract (filename, path) media pairs from post items.
+
+    Coomer posts carry a main `file` (may be empty) and a list of
+    `attachments`; both use {name, path} shapes where path is the CDN
+    location under /data. Paths already in `seen` are skipped, so the
+    same file referenced by several posts is only fetched once.
+    """
+    media = []
+    for item in items:
+        entries = []
+        main = item.get('file')
+        if isinstance(main, dict) and main.get('path'):
+            entries.append(main)
+        for att in item.get('attachments') or []:
+            if isinstance(att, dict) and att.get('path'):
+                entries.append(att)
+        for entry in entries:
+            path = str(entry['path'])
+            if path.startswith('/'):
+                path = path.lstrip('/')
+            key = path
+            if key in seen:
+                continue
+            seen.add(key)
+            name = str(entry.get('name') or '').strip()
+            media.append((name, path))
+    return media
+
+
+def coomer_filename(name: str, path: str, fallback: str = 'coomer_file') -> str:
+    """Return a safe file name, preferring the Coomer display name."""
+    candidate = name or path.rsplit('/', 1)[-1]
+    candidate = re.sub(r'[\\/\x00-\x1f]', '', candidate).strip()
+    candidate = re.sub(r'[^\w.\-]+', '_', candidate).strip('._-')
+    if not candidate:
+        candidate = fallback
+    if '.' not in candidate and '.' in path.rsplit('/', 1)[-1]:
+        candidate += '.' + path.rsplit('.', 1)[-1].lower()
+    return candidate[:240]
+
+
+def fetch_coomer_media(
+    api_base: str,
+    service: str,
+    user: str,
+    session,
+    post_id: str | None = None,
+) -> list[tuple[str, str]]:
+    """Return the (filename, path) media of a profile or single post.
+
+    Profile links are paginated through the posts endpoint (50 posts
+    per page, signalled as HTTP 400 once past the last page) up to
+    COOMER_MAX_POSTS posts. Post links fetch that one post only.
+    """
+    if post_id is not None:
+        post_url = f'{api_base}/api/v1/{service}/user/{user}/post/{post_id}'
+        response = coomer_request(session, post_url, what='post')
+        if response.status_code != 200:
+            raise CoomerError(f'Coomer post {post_id} not found at {post_url}')
+        payload = response.json()
+        posts = [payload['post']] if isinstance(payload, dict) and 'post' in payload else []
+        return parse_coomer_media(posts, set())
+
+    posts_url = f'{api_base}/api/v1/{service}/user/{user}/posts'
+    seen: set[str] = set()
+    media: list[tuple[str, str]] = []
+    offset = 0
+    scanned = 0
+    while True:
+        response = coomer_request(
+            session,
+            posts_url,
+            params={'o': offset},
+            what='posts page',
+        )
+        if response.status_code != 200:
+            break
+        posts = response.json()
+        if not isinstance(posts, list) or not posts:
+            break
+        media.extend(parse_coomer_media(posts, seen))
+        scanned += len(posts)
+        offset += len(posts)
+        if COOMER_MAX_POSTS and scanned >= COOMER_MAX_POSTS:
+            log(f'[coomer] COOMER_MAX_POSTS={COOMER_MAX_POSTS} reached')
+            break
+        if len(posts) < COOMER_PAGE_SIZE:
+            break
+    return media
+
+
+def download_coomer_file(
+    cdn_url: str,
+    dest_path: str,
+    progress_cb=None,
+    referer: str = '',
+    session=None,
+) -> None:
+    """Stream a Coomer /data file to dest_path, following CDN redirects.
+
+    coomer.st answers with a 302 to a CDN node; requests follows it and
+    the bytes are written in COOMER_CHUNK pieces while progress_cb,
+    when given, receives (current, total). Incomplete transfers raise
+    CoomerError so the caller can move on to the next file.
+    """
+    own_session = session is None
+    session = session or coomer_session()
+    headers = {}
+    if referer:
+        headers['Referer'] = referer
+    dest = Path(dest_path)
+    part = dest.with_name(dest.name + '.part')
+    written = 0
+    total = 0
+    try:
+        try:
+            response = session.get(
+                cdn_url,
+                headers=headers,
+                timeout=COOMER_TIMEOUT,
+                stream=True,
+                allow_redirects=True,
+            )
+        except requests.RequestException as exc:
+            raise CoomerError(
+                f'Coomer file {cdn_url}: {str(exc) or type(exc).__name__}'
+            ) from exc
+        try:
+            if response.status_code != 200:
+                raise CoomerError(
+                    f'HTTP {response.status_code} for Coomer file {cdn_url}'
+                )
+            total = int(response.headers.get('Content-Length') or 0)
+            with open(part, 'wb') as handle:
+                for chunk in response.iter_content(COOMER_CHUNK):
+                    if RUNNING['cancel']:
+                        raise JobCancelled()
+                    if not chunk:
+                        continue
+                    written += len(chunk)
+                    handle.write(chunk)
+                    if progress_cb is not None:
+                        progress_cb(written, total)
+        finally:
+            response.close()
+        if written == 0:
+            raise CoomerError(f'Coomer sent an empty file for {cdn_url}')
+        if total and written != total:
+            raise CoomerError(
+                f'Incomplete Coomer download: {written} of {total} bytes'
+            )
+        part.replace(dest)
+    except BaseException:
+        part.unlink(missing_ok=True)
+        raise
+    finally:
+        if own_session:
+            session.close()
+
+
+async def iter_coomer(
+    link: str,
+    temp_dir: Path,
+    job_id: int,
+    file_folders: dict[str, str | None] | None = None,
+    status_cb=None,
+):
+    """Download a Coomer profile or post file by file, yielding each file.
+
+    Mirrors iter_bunkr: one fresh subfolder per file keeps disk usage
+    bounded by the largest file, a broken file does not stop the
+    profile, and JOB_PROGRESS feeds /queue. file_folders maps each
+    path to the profile name so the worker can route the files into a
+    per-profile topic. status_cb(text) is awaited with
+    "Coomer: <n>/<total> - <filename>" before each download.
+    """
+    if RUNNING['cancel']:
+        raise JobCancelled()
+
+    parsed = parse_coomer_link(link)
+    if parsed is None:
+        raise CoomerError(
+            f'Unsupported Coomer URL {link}: expected /<service>/user/<name> '
+            'with an optional /<post_id>'
+        )
+    kind, service, user, post_id = parsed
+    api_base = _coomer_api_base(link)
+    referer = link.rsplit('?', 1)[0]
+
+    session = coomer_session()
+    try:
+        media = await asyncio.to_thread(
+            fetch_coomer_media, api_base, service, user, session, post_id
+        )
+        if not media:
+            raise CoomerError(
+                f'Coomer profile {user} ({service}) has no downloadable files'
+            )
+        title = f'{service}/{user}'
+
+        total = len(media)
+        failed = 0
+        last_error = ''
+        progress = JOB_PROGRESS.setdefault(job_id, {})
+        progress.update(total=total, current=0, current_name='')
+
+        for index, (name, path) in enumerate(media, start=1):
+            if RUNNING['cancel']:
+                raise JobCancelled()
+            if index > 1 and COOMER_FILE_DELAY > 0:
+                await asyncio.sleep(COOMER_FILE_DELAY)
+
+            progress['current'] = index
+            filename = coomer_filename(name, path)
+            progress['current_name'] = filename
+            log(f'[coomer] ({index}/{total}) Downloading {filename}')
+            if status_cb is not None:
+                await status_cb(f'Coomer: {index}/{total} \u2014 {filename}')
+
+            sub_dir = temp_dir / f'coomer{index:04d}'
+            sub_dir.mkdir()
+            dest = sub_dir / filename
+            try:
+                await asyncio.to_thread(
+                    download_coomer_file,
+                    f'{api_base}/data/{path}',
+                    str(dest),
+                    make_download_logger(filename, 'coomer'),
+                    referer,
+                    session,
+                )
+            except JobCancelled:
+                raise
+            except Exception as exc:
+                # One broken file should not kill the whole profile job.
+                failed += 1
+                last_error = str(exc) or type(exc).__name__
+                progress['failed'] = progress.get('failed', 0) + 1
+                log(f'[coomer] ({index}/{total}) Failed {path}: {last_error}')
+                continue
+
+            log(
+                f'[coomer] ({index}/{total}) Downloaded {filename} '
+                f'({format_size(dest.stat().st_size)})'
+            )
+            if file_folders is not None:
+                file_folders[str(dest)] = title
+            yield dest
+
+        if failed:
+            log(f'[coomer] {failed} of {total} file(s) failed')
+            if failed == total:
+                raise CoomerError(
+                    f'All {total} Coomer file(s) failed; last error: '
+                    f'{last_error}'
+                )
+    finally:
+        session.close()
+
 
 # ---- Pasted-text hardening ----
 # Invisible Unicode characters (zero-width spaces, direction marks, word
@@ -2665,8 +3081,8 @@ def download_bunkr_file(
             session.close()
 
 
-def make_download_logger(name: str):
-    """Log Bunkr download progress at most every PROGRESS_INTERVAL seconds."""
+def make_download_logger(name: str, tag: str = "bk"):
+    """Log download progress at most every PROGRESS_INTERVAL seconds."""
     started = time.monotonic()
     last_logged = started
 
@@ -2679,12 +3095,12 @@ def make_download_logger(name: str):
         speed = current / max(now - started, 0.001)
         if total:
             log(
-                f"[bk] {name}: {current / total * 100:.1f}% "
+                f"[{tag}] {name}: {current / total * 100:.1f}% "
                 f"({format_size(current)} of {format_size(total)}, "
                 f"{format_size(speed)}/s)"
             )
         else:
-            log(f"[bk] {name}: {format_size(current)} ({format_size(speed)}/s)")
+            log(f"[{tag}] {name}: {format_size(current)} ({format_size(speed)}/s)")
 
     return callback
 
@@ -3581,6 +3997,28 @@ async def _worker_loop() -> None:
                         async for path in downloads:
                             await handle_downloaded(path)
 
+                elif link.startswith("cm:"):
+                    async def coomer_status(text: str) -> None:
+                        """Show per-file progress in the start message."""
+                        if start_message is None:
+                            return
+                        try:
+                            await start_message.edit(f"Job #{job_id}: {text}")
+                        except Exception as exc:
+                            log(f"[coomer] Status update failed: {exc}")
+
+                    # Same pipeline as MEGA: each downloaded file goes
+                    # through hash dedup, preparation and upload.
+                    async with aclosing(iter_coomer(
+                        link[3:],
+                        Path(temp_dir),
+                        job_id,
+                        file_folders,
+                        coomer_status,
+                    )) as downloads:
+                        async for path in downloads:
+                            await handle_downloaded(path)
+
                 else:
                     # aclosing() finalizes the generator deterministically
                     # when handle_downloaded() raises, before the temp
@@ -3769,6 +4207,7 @@ async def on_mega(event) -> None:
     links = clean_urls(MEGA_REGEX.findall(text))
     # Bunkr URLs pasted alongside MEGA links share the same queue.
     links += [f"bk:{url}" for url in bunkr_links_in(text)]
+    links += [f"cm:{url}" for url in coomer_links_in(text)]
 
     if not links:
         await event.reply(
@@ -3953,6 +4392,71 @@ async def on_bunkr(event) -> None:
     )
 
 
+@client.on(events.NewMessage(
+    pattern=rf"^{GAP}/(?:coomer|cm)(?:@\w+)?{GAP}(?:\s|$)"
+))
+async def on_coomer(event) -> None:
+    """/coomer <url(s)> - queue Coomer profiles or posts (alias /cm)."""
+    if not is_allowed(event):
+        return
+
+    text = INVISIBLE_RE.sub("", event.raw_text)
+    log(f"[coomer] Command from {event.sender_id}: {text!r}")
+
+    force_dupes = bool(DUPES_REGEX.search(text))
+    if force_dupes:
+        text = DUPES_REGEX.sub(" ", text)
+    recode, text = pop_flag(RECODE_REGEX, text)
+
+    links = coomer_links_in(text)
+    usage = (
+        "Usage: /coomer <coomer-profile-or-post-url(s)> [-t topic_id] "
+        "[-newtopic <name>] [-dupes] [-recode]"
+    )
+    if not links:
+        rejected = clean_urls(re.findall(r"https?://\S+", text))
+        if rejected:
+            log(f"[coomer] Not a recognised Coomer URL: {rejected}")
+            usage = (
+                f"Not a recognised Coomer profile/post URL: {rejected[0]}\n"
+                + usage
+            )
+        await event.reply(usage, link_preview=False)
+        return
+
+    topic_id, error = await resolve_target_topic(
+        event, text,
+        "Usage: /coomer <coomer-url(s)> -newtopic <name> [-dupes] [-recode]",
+    )
+    if error:
+        await event.reply(error)
+        return
+
+    # Without an explicit target, each profile gets its own topic named
+    # after the profile, like Bunkr album topics.
+    auto_folder_topics = (
+        not NEWTOPIC_REGEX.search(text)
+        and not TOPIC_REGEX.search(text)
+        and get_topic_id(event) is None
+    )
+    add_jobs(
+        [f"cm:{url}" for url in links],
+        topic_id,
+        event.sender_id,
+        auto_folder_topics=auto_folder_topics,
+        force_dupes=force_dupes,
+        recode=recode,
+    )
+    _, pending = queue_status()
+
+    acknowledgement = await event.reply(
+        f"Saved {len(links)} Coomer link(s). Pending: {pending}"
+    )
+    spawn(
+        delete_status([acknowledgement], STATUS_DELETE_DELAY)
+    )
+
+
 @client.on(events.NewMessage(pattern=rf"^{GAP}/queue(?:@\w+)?{GAP}$"))
 async def on_queue(event) -> None:
     """/queue - show running job progress and the pending jobs."""
@@ -4090,6 +4594,8 @@ async def on_help(event) -> None:
         "/nk <url(s)> [-t <topic_id>] [-newtopic <name>] [-recode] - queue Netzkino movies\n"
         "/bunkr <url(s)> [-t <topic_id>] [-newtopic <name>] [-dupes] [-recode] - "
         "queue Bunkr albums/files (alias /bk)\n"
+        "/coomer <url(s)> [-t <topic_id>] [-newtopic <name>] [-dupes] [-recode] - "
+        "queue Coomer profiles/posts (alias /cm)\n"
         "/queue - show job progress and pending jobs\n"
         "/cancel [job_id] - cancel the running job or remove a pending one\n"
         "/failed - list recent failed jobs\n"
