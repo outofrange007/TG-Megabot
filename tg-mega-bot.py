@@ -13,7 +13,9 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
-from urllib.parse import unquote, urljoin, urlsplit, urlunsplit
+from urllib.parse import (
+    parse_qsl, quote, unquote, urlencode, urljoin, urlsplit, urlunsplit,
+)
 from contextlib import aclosing, closing, suppress
 from pathlib import Path
 
@@ -2379,6 +2381,9 @@ def parse_bunkr_album(html: str, base_url: str) -> tuple[str | None, list[str]]:
             continue
         if not parts.path.startswith(BUNKR_FILE_PATH_PREFIXES):
             continue
+        # Skip JS template fragments such as "/f/' + file.slug + '".
+        if not re.fullmatch(r"/[fvi]/[\w.-]+/?", unquote(parts.path)):
+            continue
         clean = urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
         if clean not in seen:
             seen.add(clean)
@@ -2415,14 +2420,54 @@ def bunkr_filename(cdn_url: str, fallback: str = "bunkr_file") -> str:
     return name
 
 
+# Inline JS variables on current Bunkr file pages, e.g.
+#   var jsCDN = "https:\/\/c2ru-b.cdn.cr\/storage\/media\/<uuid>.mp4";
+#   var signUrl = "https://glb-apisign.cdn.cr/sign";
+BUNKR_JS_VAR_REGEX = re.compile(
+    r"\bvar\s+(jsCDN|signUrl)\s*=\s*[\"']([^\"']+)[\"']"
+)
+
+
+def parse_bunkr_js_vars(html: str) -> dict[str, str]:
+    """Return the jsCDN / signUrl values embedded in a file page."""
+    return {
+        name: value.replace("\\/", "/").strip()
+        for name, value in BUNKR_JS_VAR_REGEX.findall(html)
+        if value.strip()
+    }
+
+
+def _bunkr_page_title_name(soup, cdn_url: str) -> str | None:
+    """Return the original filename from og:title when it looks like one.
+
+    The CDN path only holds a UUID; og:title carries the uploader's file
+    name (e.g. "Katjak.mp4"). It is used when it has the same suffix as
+    the CDN file, so a page title never replaces the real extension.
+    """
+    meta = soup.find("meta", attrs={"property": "og:title"})
+    title = (meta.get("content", "") if meta else "").strip()
+    cdn_suffix = Path(urlsplit(cdn_url).path).suffix.lower()
+    if title and cdn_suffix and Path(title).suffix.lower() == cdn_suffix:
+        return bunkr_filename("x/" + quote(title, safe=""))
+    return None
+
+
 def parse_bunkr_file_page(html: str, page_url: str) -> tuple[str, str]:
     """Return (direct CDN URL, filename) from file page HTML.
 
-    Order: <source src> (video/audio player), then <a href> pointing to
-    a Bunkr CDN host (download button), then <video src> and <img src>
-    on a CDN host (image pages). Raises BunkrError when nothing fits.
+    Order: the jsCDN variable of the current player script (needs a
+    signature, see sign_bunkr_url), then <source src> (older player),
+    <a href> pointing to a Bunkr CDN host (download button), then
+    <video src> and <img src> on a CDN host (image pages). Raises
+    BunkrError when nothing fits.
     """
     soup = _bunkr_soup(html)
+    slug = urlsplit(page_url).path.rstrip("/").rsplit("/", 1)[-1]
+
+    js_cdn = parse_bunkr_js_vars(html).get("jsCDN")
+    if js_cdn and urlsplit(js_cdn).scheme in ("http", "https"):
+        name = _bunkr_page_title_name(soup, js_cdn)
+        return js_cdn, name or bunkr_filename(js_cdn, fallback=slug)
 
     def absolute(value: str) -> str | None:
         url = urljoin(page_url, value.strip())
@@ -2450,8 +2495,41 @@ def parse_bunkr_file_page(html: str, page_url: str) -> tuple[str, str]:
         )
 
     cdn_url = candidates[0]
-    slug = urlsplit(page_url).path.rstrip("/").rsplit("/", 1)[-1]
     return cdn_url, bunkr_filename(cdn_url, fallback=slug)
+
+
+def sign_bunkr_url(
+    session, raw_url: str, sign_url: str, referer: str | None = None
+) -> str:
+    """Add the token/ex parameters the Bunkr CDN requires.
+
+    Mirrors getSignedUrl() of the Bunkr player: GET <signUrl>?path=<cdn
+    path> returns {"token": ..., "ex": ...}; both are appended to the
+    CDN URL. Unsigned requests are answered with HTTP 403.
+    """
+    parts = urlsplit(raw_url)
+    response = bunkr_request(
+        session,
+        f"{sign_url}?path={quote(unquote(parts.path), safe='')}",
+        headers={
+            "Referer": referer or _bunkr_referer(raw_url),
+            "Accept": "application/json",
+        },
+        what="signature",
+    )
+    with response:
+        try:
+            data = response.json()
+            token, expires = data["token"], data["ex"]
+        except (ValueError, KeyError, TypeError) as exc:
+            raise BunkrError(
+                f"Unexpected Bunkr signature response for {raw_url}: {exc}"
+            ) from exc
+    query = urlencode(
+        [(k, v) for k, v in parse_qsl(parts.query) if k not in ("token", "ex")]
+        + [("token", str(token)), ("ex", str(expires))]
+    )
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, query, ""))
 
 
 def fetch_bunkr_album(
@@ -2501,7 +2579,16 @@ def get_bunkr_direct_url(file_page_url: str, session=None) -> tuple[str, str]:
     try:
         response = bunkr_request(session, file_page_url, what="file page")
         with response:
-            return parse_bunkr_file_page(response.text, response.url)
+            html, page_url = response.text, response.url
+        cdn_url, filename = parse_bunkr_file_page(html, page_url)
+        # The current player only streams signed URLs; sign right before
+        # the download so the short-lived token is still valid.
+        sign_url = parse_bunkr_js_vars(html).get("signUrl")
+        if sign_url and cdn_url == parse_bunkr_js_vars(html).get("jsCDN"):
+            cdn_url = sign_bunkr_url(
+                session, cdn_url, sign_url, _bunkr_referer(page_url)
+            )
+        return cdn_url, filename
     finally:
         if own_session:
             session.close()

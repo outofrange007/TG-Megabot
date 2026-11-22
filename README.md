@@ -1,10 +1,11 @@
 # tg-mega-bot
 
 A Telegram bot that mirrors content into a Telegram supergroup with
-forum topics. It downloads from three sources and uploads the results
+forum topics. It downloads from four sources and uploads the results
 straight into the group:
 
 - **MEGA** — public file and folder links (`/mega`)
+- **Bunkr** — public albums and single files (`/bunkr`, alias `/bk`)
 - **YouTube** — videos via yt-dlp, public or cookie-authenticated (`/yt`)
 - **Netzkino** — free movies via yt-dlp's built-in extractor (`/nk`)
 
@@ -25,8 +26,16 @@ straight into the group:
 - Large-file handling: files above ~1.9 GiB trigger a prompt —
   *Try unsplit*, *Split (N)* or *Keep on server* — with a configurable
   timeout that falls back to splitting.
-- MP4 faststart optimization (stream copy, no re-encoding) so videos
-  start playing immediately in Telegram.
+- Optional video preparation with `-recode` (see *Video preparation*):
+  videos that are already H.264/AAC within 720p are only remuxed
+  (stream copy, no quality loss); all others are re-encoded to
+  H.264/AAC with a 720p limit. Every video gets MP4 faststart and has
+  its metadata removed.
+- Image cleanup with Pillow: EXIF orientation is applied, then all
+  metadata (EXIF/XMP/text chunks) is stripped before upload.
+- Bunkr albums are processed file by file; each file is downloaded,
+  checked for duplicates and uploaded on its own. An album without a
+  topic target gets its own topic named after the album.
 - Forum topic support: commands accept `-t <topic_id>` and
   `-newtopic <name>`, and the bot learns topics created in the group.
   A plain `/mega` folder link without a topic target automatically
@@ -75,6 +84,7 @@ the target topic.
 ```
 /mega https://mega.nz/folder/XXXX#YYYY -newtopic Movies
 /mega https://mega.nz/folder/XXXX#YYYY -dupes
+/bunkr https://bunkr.si/a/XXXX -newtopic Album
 /yt https://www.youtube.com/watch?v=XXXX -t 42
 /nk https://www.netzkino.de/#!/filme/some-movie
 ```
@@ -88,6 +98,7 @@ forum topic per top-level folder of the share (see below), and
 | Command | Description |
 | --- | --- |
 | `/mega <link(s)> [-t <topic_id>] [-newtopic <name>] [-dupes]` | Queue MEGA file or folder links |
+| `/bunkr <url(s)> [-t <topic_id>] [-newtopic <name>] [-dupes]` | Queue Bunkr albums or files (alias `/bk`) |
 | `/yt <url(s)> [-t <topic_id>] [-newtopic <name>]` | Queue YouTube videos |
 | `/nk <url(s)> [-t <topic_id>] [-newtopic <name>]` | Queue Netzkino movies |
 | `/queue` | Show the running job and pending count |
@@ -127,6 +138,47 @@ everything in the link is downloaded and sent again:
 
 The registry itself is not touched — it can be combined freely with
 `-t` and `-newtopic`, and later jobs without the flag skip as usual.
+
+## Video preparation
+
+By default every video (MP4, MKV, WebM, AVI, MOV, ...) is copied into a
+Telegram-optimised MP4 container by stream copy (no re-encoding, faststart, subtitles and
+metadata dropped). If the codecs cannot be stored in MP4 (e.g. WMV), the
+original file is uploaded unchanged. Adding
+`-recode` to `/mega`, `/bunkr`, `/yt` or `/nk` (or setting
+`VIDEO_REENCODE=1` for all jobs) enables the preparation below.
+
+With `-recode`, every video is inspected with `ffprobe`. The size check
+is orientation-independent: the **long edge must be ≤ 1280** and the
+**short edge ≤ 720**, so both 1280×720 (landscape) and 720×1280
+(portrait) pass.
+
+A video is only **remuxed** (stream copy, takes seconds, no quality
+loss) when all of these hold:
+
+- video codec H.264 with pixel format `yuv420p`
+- long edge ≤ 1280 and short edge ≤ 720
+- audio codec AAC, or no audio track
+
+Otherwise it is **re-encoded** with libx264 (CRF 26, preset `slow`),
+AAC 128k, and scaled down into the 720p box; smaller videos are never
+enlarged. If `ffprobe` fails, the bot re-encodes to be safe. In both
+cases only the first video and audio stream are kept, metadata and
+chapters are removed and MP4 faststart is applied. The log line
+`[opt] Remuxing ...` or `[opt] Re-encoding ... (codec=..., WxH, ...)`
+shows which path was taken and why.
+
+## Bunkr
+
+`/bunkr` accepts album links (`/a/<id>`) and single file links
+(`/f/`, `/v/`, `/i/`) on any Bunkr domain (`bunkr.<tld>` or `bunkrr.<tld>`, e.g. `bunkr.cr`,
+`bunkr.si`, `bunkr.su`), so new mirrors work without a code change. Bunkr
+links pasted into `/mega` are queued as well. Rate limits (HTTP 429),
+server errors and connection drops are retried with 10/30/60 s
+back-off; HTTP 403/404 fail the file immediately. A failing file does
+not stop the album. The pages are parsed as static HTML — content that
+Bunkr only loads via JavaScript cannot be found and produces a clear
+error.
 
 ## Large files
 
@@ -194,6 +246,9 @@ region for `/nk` to work; elsewhere downloads fail with HTTP 403.
 | `MEGA_FAIL_STREAK` | `10` | Consecutive MEGA failures that trigger a share cooldown |
 | `MEGA_COOLDOWN` | `300` | Seconds a throttled MEGA share is paused before it is probed again |
 | `MEGA_AUTO_RETRIES` | `3` | Automatic re-queue runs for a MEGA job aborted by API error -16; each run doubles `MEGA_FILE_DELAY` |
+| `BUNKR_FILE_DELAY` | `1.0` | Seconds between consecutive Bunkr file downloads |
+| `SESSION_NAME` | `bot_session` | File name of the Telethon session inside `DATA_DIR` |
+| `VIDEO_REENCODE` | `0` | `1` applies 720p preparation to every job, as if `-recode` were always given |
 
 ## Troubleshooting
 
