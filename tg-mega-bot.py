@@ -219,14 +219,31 @@ NEWTOPIC_REGEX = re.compile(
 # registry already knows, instead of skipping them.
 DUPES_REGEX = re.compile(r"(?:^|\s)-dupes(?:\s|$)", re.IGNORECASE)
 
+# Match an optional "-recode" flag: prepare videos for Telegram (720p
+# H.264/AAC, remux when they already fit). Without it, videos are
+# uploaded exactly as downloaded.
+RECODE_REGEX = re.compile(r"(?:^|\s)-recode(?:\s|$)", re.IGNORECASE)
+
+
+def pop_flag(regex: re.Pattern, text: str) -> tuple[bool, str]:
+    """Return (flag_present, text_without_flag)."""
+    if regex.search(text):
+        return True, regex.sub(" ", text)
+    return False, text
+
 # ---- Bunkr configuration ----
 # Known Bunkr site domains. Album pages live at /a/<id>, file pages at
 # /f/<slug>, /v/<slug> (video) and /i/<slug> (image).
 BUNKR_DOMAINS = {
     "bunkr.si", "bunkr.su", "bunkr.ru", "bunkr.black",
     "bunkr.media", "bunkr.is", "bunkr.to", "bunkr.la",
-    "bunkr.fi", "bunkr.pk",
+    "bunkr.fi", "bunkr.pk", "bunkr.cr", "bunkr.ph", "bunkr.ws",
+    "bunkr.ac", "bunkr.ax", "bunkr.red", "bunkr.site", "bunkr.sk",
+    "bunkr.ps", "bunkrr.su", "bunkrr.ru",
 }
+# Bunkr moves to new TLDs often; any bunkr.<tld> / bunkrr.<tld> host is
+# accepted as well, so a new mirror works without a code change.
+BUNKR_SITE_REGEX = re.compile(r"(?:^|\.)(bunkrr?\.[a-z]{2,12})$")
 BUNKR_FILE_PATH_PREFIXES = ("/f/", "/v/", "/i/")
 BUNKR_ALBUM_PATH_PREFIX = "/a/"
 
@@ -370,7 +387,8 @@ def init_db() -> None:
                 force_dupes INTEGER NOT NULL DEFAULT 0,
                 file_delay REAL NOT NULL DEFAULT 0,
                 retry_attempt INTEGER NOT NULL DEFAULT 0,
-                not_before REAL
+                not_before REAL,
+                recode INTEGER NOT NULL DEFAULT 0
             )
         """)
 
@@ -400,6 +418,10 @@ def init_db() -> None:
             )
         if "not_before" not in columns:
             db.execute("ALTER TABLE jobs ADD COLUMN not_before REAL")
+        if "recode" not in columns:
+            db.execute(
+                "ALTER TABLE jobs ADD COLUMN recode INTEGER NOT NULL DEFAULT 0"
+            )
 
         # Registry of forum topics the bot created or saw being created.
         db.execute("""
@@ -461,11 +483,13 @@ def add_jobs(
     file_delay: float = 0.0,
     retry_attempt: int = 0,
     not_before: float | None = None,
+    recode: bool = False,
 ) -> list[int]:
     """Add new jobs to the persistent queue; return their job IDs.
 
     not_before is an epoch timestamp: the job is not claimed before
     that time (used to pause jobs after a MEGA bandwidth limit).
+    recode enables 720p video preparation for this job (-recode flag).
     """
     with closing(db_connect()) as db, db:
         ids: list[int] = []
@@ -475,9 +499,10 @@ def add_jobs(
                 """
                 INSERT INTO jobs (
                     link, topic_id, requester, status, auto_folder_topics,
-                    force_dupes, file_delay, retry_attempt, not_before
+                    force_dupes, file_delay, retry_attempt, not_before,
+                    recode
                 )
-                VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     link,
@@ -488,6 +513,7 @@ def add_jobs(
                     float(file_delay),
                     int(retry_attempt),
                     not_before,
+                    int(recode),
                 ),
             )
             ids.append(int(cursor.lastrowid))
@@ -496,7 +522,7 @@ def add_jobs(
 
 
 def claim_job() -> (
-    tuple[int, str, int | None, int, bool, bool, float, int] | None
+    tuple[int, str, int | None, int, bool, bool, float, int, bool] | None
 ):
     """Get the oldest claimable pending job and mark it as running.
 
@@ -507,7 +533,7 @@ def claim_job() -> (
         row = db.execute(
             """
             SELECT id, link, topic_id, requester, auto_folder_topics,
-                   force_dupes, file_delay, retry_attempt
+                   force_dupes, file_delay, retry_attempt, recode
             FROM jobs
             WHERE status = 'pending'
               AND (not_before IS NULL OR not_before <= ?)
@@ -533,6 +559,7 @@ def claim_job() -> (
             bool(row[5]),
             float(row[6] or 0.0),
             int(row[7] or 0),
+            bool(row[8]),
         )
 
 
@@ -2182,12 +2209,22 @@ def _bunkr_host(url: str) -> str:
     return host[4:] if host.startswith("www.") else host
 
 
+def _bunkr_site_domain(host: str) -> str | None:
+    """Return the Bunkr site domain a host belongs to (e.g. bunkr.cr)."""
+    for domain in BUNKR_DOMAINS:
+        if host == domain or host.endswith("." + domain):
+            return domain
+    match = BUNKR_SITE_REGEX.search(host)
+    return match.group(1) if match else None
+
+
 def is_bunkr_url(url: str) -> bool:
-    """Return True when the URL's host is a known Bunkr site domain."""
+    """Return True when the URL's host is a Bunkr site domain."""
     try:
-        return _bunkr_host(url) in BUNKR_DOMAINS
+        host = _bunkr_host(url)
     except ValueError:
         return False
+    return _bunkr_site_domain(host) == host
 
 
 def is_bunkr_cdn_url(url: str) -> bool:
@@ -2196,11 +2233,11 @@ def is_bunkr_cdn_url(url: str) -> bool:
         host = (urlsplit(url).hostname or "").lower().rstrip(".")
     except ValueError:
         return False
-    for domain in BUNKR_DOMAINS:
-        if host.endswith("." + domain):
-            label = host[: -len(domain) - 1].split(".")[-1]
-            return bool(BUNKR_CDN_LABEL_REGEX.match(label))
-    return False
+    domain = _bunkr_site_domain(host)
+    if not domain or host == domain:
+        return False
+    label = host[: -len(domain) - 1].split(".")[-1]
+    return bool(BUNKR_CDN_LABEL_REGEX.match(label))
 
 
 def bunkr_links_in(text: str) -> list[str]:
@@ -2472,11 +2509,8 @@ def get_bunkr_direct_url(file_page_url: str, session=None) -> tuple[str, str]:
 
 def _bunkr_referer(url: str) -> str:
     """Return the base URL of the Bunkr site that a URL belongs to."""
-    host = _bunkr_host(url)
-    for domain in BUNKR_DOMAINS:
-        if host == domain or host.endswith("." + domain):
-            return f"https://{domain}/"
-    return "https://bunkr.si/"
+    domain = _bunkr_site_domain(_bunkr_host(url))
+    return f"https://{domain}/" if domain else "https://bunkr.si/"
 
 
 def download_bunkr_file(
@@ -2872,9 +2906,11 @@ VIDEO_EXTENSIONS = {
     ".mp4", ".m4v", ".mov", ".mkv", ".avi", ".webm", ".wmv", ".flv",
     ".mpg", ".mpeg", ".ts", ".m2ts", ".3gp", ".ogv", ".vob",
 }
+# Videos are uploaded as downloaded unless a job carries -recode.
+# VIDEO_REENCODE=1 turns 720p preparation on for every job (default off).
 VIDEO_REENCODE = (
-    os.environ.get("VIDEO_REENCODE", "1").strip().lower()
-    not in ("0", "false", "no")
+    os.environ.get("VIDEO_REENCODE", "0").strip().lower()
+    in ("1", "true", "yes")
 )
 FFMPEG_TIMEOUT = 7200
 
@@ -3045,8 +3081,79 @@ def _needs_reencode(info: dict) -> bool:
     return False
 
 
-async def prepare_video_for_telegram(path: Path) -> Path:
+async def _run_ffmpeg(
+    ffmpeg_cmd: list[str], path: Path, target: Path, action: str
+) -> None:
+    """Run ffmpeg_cmd writing to a temp .mp4, then move it to target.
+
+    Honors job cancellation and FFMPEG_TIMEOUT; raises RuntimeError with
+    the tail of FFmpeg's stderr on failure.
+    """
+    with tempfile.TemporaryDirectory(
+        prefix="video-prep-", dir=str(path.parent)
+    ) as temporary:
+        output = Path(temporary) / "prepared.mp4"
+        with tempfile.TemporaryFile() as error_log:
+            process = await asyncio.create_subprocess_exec(
+                *ffmpeg_cmd, str(output),
+                stdout=asyncio.subprocess.DEVNULL, stderr=error_log,
+            )
+            RUNNING["process"] = process
+            wait_task = asyncio.create_task(process.wait())
+            started = time.monotonic()
+            try:
+                while not wait_task.done():
+                    if RUNNING["cancel"]:
+                        raise JobCancelled()
+                    if time.monotonic() - started > FFMPEG_TIMEOUT:
+                        raise RuntimeError(f"FFmpeg timed out: {path.name}")
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.shield(wait_task), timeout=1
+                        )
+                    except asyncio.TimeoutError:
+                        pass
+                await wait_task
+                if RUNNING["cancel"]:
+                    raise JobCancelled()
+                if process.returncode:
+                    error_log.seek(0, os.SEEK_END)
+                    length = error_log.tell()
+                    error_log.seek(max(0, length - 4000))
+                    detail = error_log.read().decode("utf-8", errors="replace")
+                    raise RuntimeError(
+                        f"{action} failed for {path.name}: {detail.strip()}"
+                    )
+            finally:
+                if process.returncode is None:
+                    try:
+                        process.terminate()
+                    except ProcessLookupError:
+                        pass
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.shield(wait_task), timeout=5
+                        )
+                    except asyncio.TimeoutError:
+                        try:
+                            process.kill()
+                        except ProcessLookupError:
+                            pass
+                        await wait_task
+                if RUNNING["process"] is process:
+                    RUNNING["process"] = None
+
+        if not output.is_file() or not output.stat().st_size:
+            raise RuntimeError(f"FFmpeg produced no output for: {path.name}")
+        output.replace(target)
+
+
+
+async def prepare_video_for_telegram(path: Path, recode: bool = True) -> Path:
     """Prepare a video for Telegram upload within a 720p H.264/AAC envelope.
+
+    With recode=False (and VIDEO_REENCODE off) every video goes through
+    container_to_mp4() (stream copy into an optimised MP4, no re-encoding).
 
     If the file is already H.264/yuv420p/AAC and fits inside the 720p box,
     only a fast remux is performed (stream copy + faststart + metadata strip).
@@ -3061,11 +3168,11 @@ async def prepare_video_for_telegram(path: Path) -> Path:
         return path
     if RUNNING["cancel"]:
         raise JobCancelled()
-    if not VIDEO_REENCODE:
-        raise RuntimeError(
-            "VIDEO_REENCODE=0 conflicts with mandatory 720p preparation; "
-            "set VIDEO_REENCODE=1"
-        )
+    if not (recode or VIDEO_REENCODE):
+        # Without -recode the streams stay untouched: every video
+        # (MP4 included) is stream-copied into a Telegram-optimised MP4
+        # container (faststart, metadata stripped), no re-encoding.
+        return await container_to_mp4(path)
     if not shutil.which("ffmpeg"):
         raise RuntimeError("FFmpeg is required for 720p video preparation")
 
@@ -3109,70 +3216,66 @@ async def prepare_video_for_telegram(path: Path) -> Path:
             "-movflags", "+faststart",
         ]
 
-    with tempfile.TemporaryDirectory(
-        prefix="video-720p-", dir=str(path.parent)
-    ) as temporary:
-        output = Path(temporary) / "prepared.mp4"
-        with tempfile.TemporaryFile() as error_log:
-            process = await asyncio.create_subprocess_exec(
-                *ffmpeg_cmd, str(output),
-                stdout=asyncio.subprocess.DEVNULL, stderr=error_log,
-            )
-            RUNNING["process"] = process
-            wait_task = asyncio.create_task(process.wait())
-            started = time.monotonic()
-            try:
-                while not wait_task.done():
-                    if RUNNING["cancel"]:
-                        raise JobCancelled()
-                    if time.monotonic() - started > FFMPEG_TIMEOUT:
-                        raise RuntimeError(f"FFmpeg timed out: {path.name}")
-                    try:
-                        await asyncio.wait_for(
-                            asyncio.shield(wait_task), timeout=1
-                        )
-                    except asyncio.TimeoutError:
-                        pass
-                await wait_task
-                if RUNNING["cancel"]:
-                    raise JobCancelled()
-                if process.returncode:
-                    error_log.seek(0, os.SEEK_END)
-                    length = error_log.tell()
-                    error_log.seek(max(0, length - 4000))
-                    detail = error_log.read().decode("utf-8", errors="replace")
-                    action = "Re-encoding" if reencode else "Remux"
-                    raise RuntimeError(
-                        f"{action} failed for {path.name}: {detail.strip()}"
-                    )
-            finally:
-                if process.returncode is None:
-                    try:
-                        process.terminate()
-                    except ProcessLookupError:
-                        pass
-                    try:
-                        await asyncio.wait_for(
-                            asyncio.shield(wait_task), timeout=5
-                        )
-                    except asyncio.TimeoutError:
-                        try:
-                            process.kill()
-                        except ProcessLookupError:
-                            pass
-                        await wait_task
-                if RUNNING["process"] is process:
-                    RUNNING["process"] = None
-
-        if not output.is_file() or not output.stat().st_size:
-            raise RuntimeError(f"FFmpeg produced no output for: {path.name}")
-        output.replace(target)
+    action = "Re-encoding" if reencode else "Remux"
+    await _run_ffmpeg(ffmpeg_cmd, path, target, action)
 
     if target != path:
         path.unlink(missing_ok=True)
     action_label = "Re-encoded" if reencode else "Remuxed"
     log(
         f"[opt] {action_label}: {target.name} "
+        f"({format_size(target.stat().st_size)})"
+    )
+    return target
+
+
+async def container_to_mp4(path: Path) -> Path:
+    """Stream-copy a video into a Telegram-optimised MP4 container.
+
+    Used for every video (MP4 included) when -recode is not given.
+
+    Streams are stream-copied (no quality loss, fast): first real video
+    stream (cover art skipped), all audio tracks, faststart for instant
+    playback, metadata and chapters stripped, subtitles dropped (most
+    subtitle formats cannot be stored in MP4). HEVC gets the hvc1 tag so
+    Apple clients can play it. If the codecs do not fit into MP4 (e.g.
+    WMV/FLV legacy codecs) or FFmpeg is missing, the original file is
+    uploaded unchanged instead of failing the job.
+    """
+    if not shutil.which("ffmpeg"):
+        log(f"[opt] FFmpeg missing; uploading {path.name} unchanged")
+        return path
+
+    probe = await asyncio.to_thread(_probe_video, path)
+    target = media_target(path, ".mp4")
+    ffmpeg_cmd = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error",
+        "-nostdin", "-y", "-i", str(path),
+        "-map", "0:V:0", "-map", "0:a?",
+        "-map_metadata", "-1", "-map_chapters", "-1",
+        "-sn", "-dn",
+        "-c", "copy",
+    ]
+    if probe.get("video_codec") == "hevc":
+        ffmpeg_cmd += ["-tag:v", "hvc1"]
+    ffmpeg_cmd += ["-movflags", "+faststart"]
+
+    log(
+        f"[opt] Copying {path.name} into MP4 container (stream copy, "
+        f"codec={probe.get('video_codec')}, audio={probe.get('audio_codec')})"
+    )
+    try:
+        await _run_ffmpeg(ffmpeg_cmd, path, target, "MP4 container copy")
+    except JobCancelled:
+        raise
+    except RuntimeError as exc:
+        log(f"[opt] {exc}; uploading {path.name} unchanged")
+        return path
+
+    if target != path:
+        path.unlink(missing_ok=True)
+    log(
+        f"[opt] Container copied: {target.name} "
         f"({format_size(target.stat().st_size)})"
     )
     return target
@@ -3239,6 +3342,7 @@ async def _worker_loop() -> None:
             force_dupes,
             file_delay,
             retry_attempt,
+            recode,
         ) = job
         RUNNING.update(job_id=job_id, process=None, cancel=False)
         JOB_PROGRESS[job_id] = {
@@ -3297,7 +3401,9 @@ async def _worker_loop() -> None:
                 upload_path = await asyncio.to_thread(
                     prepare_image_for_telegram, path
                 )
-                upload_path = await prepare_video_for_telegram(upload_path)
+                upload_path = await prepare_video_for_telegram(
+                    upload_path, recode
+                )
                 if RUNNING["cancel"]:
                     raise JobCancelled()
 
@@ -3470,6 +3576,7 @@ async def _worker_loop() -> None:
                     force_dupes,
                     file_delay=next_delay,
                     retry_attempt=retry_attempt + 1,
+                    recode=recode,
                 )[0]
                 log(
                     f"[worker] Job #{job_id} re-queued as job #{new_id} "
@@ -3517,6 +3624,7 @@ async def _worker_loop() -> None:
                     force_dupes,
                     file_delay=file_delay,
                     retry_attempt=retry_attempt + 1,
+                    recode=recode,
                     not_before=time.time() + wait,
                 )[0]
                 log(
@@ -3556,7 +3664,7 @@ async def _worker_loop() -> None:
 # ---- Telegram commands ----
 @client.on(events.NewMessage(pattern=rf"^{GAP}/mega(?:@\w+)?{GAP}(?:\s|$)"))
 async def on_mega(event) -> None:
-    """/mega <link(s)> [-t topic_id] [-newtopic <name>] [-dupes]."""
+    """/mega <link(s)> [-t topic_id] [-newtopic <name>] [-dupes] [-recode]."""
     if not is_allowed(event):
         return
 
@@ -3569,6 +3677,7 @@ async def on_mega(event) -> None:
     force_dupes = bool(DUPES_REGEX.search(text))
     if force_dupes:
         text = DUPES_REGEX.sub(" ", text)
+    recode, text = pop_flag(RECODE_REGEX, text)
 
     links = clean_urls(MEGA_REGEX.findall(text))
     # Bunkr URLs pasted alongside MEGA links share the same queue.
@@ -3577,13 +3686,13 @@ async def on_mega(event) -> None:
     if not links:
         await event.reply(
             "Usage: /mega <mega-link(s)> [-t topic_id] "
-            "[-newtopic <name>] [-dupes]"
+            "[-newtopic <name>] [-dupes] [-recode]"
         )
         return
 
     topic_id, error = await resolve_target_topic(
         event, text,
-        "Usage: /mega <mega-link(s)> -newtopic <name> [-dupes]",
+        "Usage: /mega <mega-link(s)> -newtopic <name> [-dupes] [-recode]",
     )
     if error:
         await event.reply(error)
@@ -3600,6 +3709,7 @@ async def on_mega(event) -> None:
         event.sender_id,
         auto_folder_topics=auto_folder_topics,
         force_dupes=force_dupes,
+        recode=recode,
     )
     _, pending = queue_status()
 
@@ -3615,12 +3725,13 @@ async def on_mega(event) -> None:
 
 @client.on(events.NewMessage(pattern=rf"^{GAP}/yt(?:@\w+)?{GAP}(?:\s|$)"))
 async def on_yt(event) -> None:
-    """/yt <url(s)> [-t <topic_id>] [-newtopic <name>] - queue YouTube videos."""
+    """/yt <url(s)> [-t <topic_id>] [-newtopic <name>] [-recode] - queue YouTube videos."""
     if not is_allowed(event):
         return
 
     text = INVISIBLE_RE.sub("", event.raw_text)
     log(f"[yt] Command from {event.sender_id}: {text!r}")
+    recode, text = pop_flag(RECODE_REGEX, text)
 
     urls = clean_urls(YT_REGEX.findall(text))
 
@@ -3637,7 +3748,10 @@ async def on_yt(event) -> None:
         await event.reply(error)
         return
 
-    add_jobs([f"yt:{url}" for url in urls], topic_id, event.sender_id)
+    add_jobs(
+        [f"yt:{url}" for url in urls], topic_id, event.sender_id,
+        recode=recode,
+    )
     _, pending = queue_status()
 
     acknowledgement = await event.reply(
@@ -3650,12 +3764,13 @@ async def on_yt(event) -> None:
 
 @client.on(events.NewMessage(pattern=rf"^{GAP}/nk(?:@\w+)?{GAP}(?:\s|$)"))
 async def on_nk(event) -> None:
-    """/nk <url(s)> [-t <topic_id>] [-newtopic <name>] - queue Netzkino movies."""
+    """/nk <url(s)> [-t <topic_id>] [-newtopic <name>] [-recode] - queue Netzkino movies."""
     if not is_allowed(event):
         return
 
     text = INVISIBLE_RE.sub("", event.raw_text)
     log(f"[nk] Command from {event.sender_id}: {text!r}")
+    recode, text = pop_flag(RECODE_REGEX, text)
 
     urls = clean_urls(NETZKINO_REGEX.findall(text))
 
@@ -3672,7 +3787,10 @@ async def on_nk(event) -> None:
         await event.reply(error)
         return
 
-    add_jobs([f"nk:{url}" for url in urls], topic_id, event.sender_id)
+    add_jobs(
+        [f"nk:{url}" for url in urls], topic_id, event.sender_id,
+        recode=recode,
+    )
     _, pending = queue_status()
 
     acknowledgement = await event.reply(
@@ -3687,7 +3805,7 @@ async def on_nk(event) -> None:
     pattern=rf"^{GAP}/(?:bunkr|bk)(?:@\w+)?{GAP}(?:\s|$)"
 ))
 async def on_bunkr(event) -> None:
-    """/bunkr <url(s)> [-t topic_id] [-newtopic <name>] [-dupes]."""
+    """/bunkr <url(s)> [-t topic_id] [-newtopic <name>] [-dupes] [-recode]."""
     if not is_allowed(event):
         return
 
@@ -3697,19 +3815,27 @@ async def on_bunkr(event) -> None:
     force_dupes = bool(DUPES_REGEX.search(text))
     if force_dupes:
         text = DUPES_REGEX.sub(" ", text)
+    recode, text = pop_flag(RECODE_REGEX, text)
 
     links = bunkr_links_in(text)
     usage = (
         "Usage: /bunkr <bunkr-album-or-file-url(s)> [-t topic_id] "
-        "[-newtopic <name>] [-dupes]"
+        "[-newtopic <name>] [-dupes] [-recode]"
     )
     if not links:
-        await event.reply(usage)
+        rejected = clean_urls(re.findall(r"https?://\S+", text))
+        if rejected:
+            log(f"[bunkr] Not a recognised Bunkr URL: {rejected}")
+            usage = (
+                f"Not a recognised Bunkr album/file URL: {rejected[0]}\n"
+                + usage
+            )
+        await event.reply(usage, link_preview=False)
         return
 
     topic_id, error = await resolve_target_topic(
         event, text,
-        "Usage: /bunkr <bunkr-url(s)> -newtopic <name> [-dupes]",
+        "Usage: /bunkr <bunkr-url(s)> -newtopic <name> [-dupes] [-recode]",
     )
     if error:
         await event.reply(error)
@@ -3728,6 +3854,7 @@ async def on_bunkr(event) -> None:
         event.sender_id,
         auto_folder_topics=auto_folder_topics,
         force_dupes=force_dupes,
+        recode=recode,
     )
     _, pending = queue_status()
 
@@ -3870,11 +3997,11 @@ async def on_help(event) -> None:
 
     await event.reply(
         "Available commands:\n"
-        "/mega <link(s)> [-t <topic_id>] [-newtopic <name>] [-dupes] - "
+        "/mega <link(s)> [-t <topic_id>] [-newtopic <name>] [-dupes] [-recode] - "
         "queue MEGA links\n"
-        "/yt <url(s)> [-t <topic_id>] [-newtopic <name>] - queue YouTube videos\n"
-        "/nk <url(s)> [-t <topic_id>] [-newtopic <name>] - queue Netzkino movies\n"
-        "/bunkr <url(s)> [-t <topic_id>] [-newtopic <name>] [-dupes] - "
+        "/yt <url(s)> [-t <topic_id>] [-newtopic <name>] [-recode] - queue YouTube videos\n"
+        "/nk <url(s)> [-t <topic_id>] [-newtopic <name>] [-recode] - queue Netzkino movies\n"
+        "/bunkr <url(s)> [-t <topic_id>] [-newtopic <name>] [-dupes] [-recode] - "
         "queue Bunkr albums/files (alias /bk)\n"
         "/queue - show job progress and pending jobs\n"
         "/cancel [job_id] - cancel the running job or remove a pending one\n"
@@ -3884,6 +4011,8 @@ async def on_help(event) -> None:
         "/topics - list known forum topics\n"
         "/deltopic [id|all] [purge] - remove topics from the registry\n"
         "/dupes [reset] - duplicate registry and skip history\n"
+        "-recode on any download command: convert videos to max. 720p "
+        "(default: upload videos as-is)\n"
         "/help - show this text",
         link_preview=False,
     )
