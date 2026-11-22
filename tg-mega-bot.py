@@ -309,6 +309,13 @@ COOMER_FILE_DELAY = env_float('COOMER_FILE_DELAY', 1.0)
 COOMER_MAX_POSTS = int(env_float('COOMER_MAX_POSTS', 0))
 # Page size of the posts endpoint; the server caps it at 50 per page.
 COOMER_PAGE_SIZE = 50
+# Connect timeout in seconds for CDN file requests: Coomer's CDN node
+# net (91.149.227.0/24) sometimes has no route at all, and then a short
+# timeout keeps a dead download from stalling for the read timeout.
+COOMER_CONNECT_TIMEOUT = env_float('COOMER_CONNECT_TIMEOUT', 10.0)
+# Consecutive CDN connection failures that abort a profile job early
+# instead of grinding through every file of the profile.
+COOMER_CDN_FAIL_LIMIT = int(env_float('COOMER_CDN_FAIL_LIMIT', 3))
 
 
 class CoomerError(RuntimeError):
@@ -478,6 +485,22 @@ def coomer_filename(name: str, path: str, fallback: str = 'coomer_file') -> str:
     return candidate[:240]
 
 
+def _is_coomer_connection_error(exc: Exception) -> bool:
+    """Return True for CoomerError messages that signal a dead CDN node.
+
+    "Network is unreachable" and friends mean the host has no route to
+    the CDN node net at all; the caller counts them and aborts a job
+    after COOMER_CDN_FAIL_LIMIT in a row instead of retrying file by
+    file for the whole profile.
+    """
+    text = str(exc).lower()
+    return any(marker in text for marker in (
+        'unreachable', 'failed to establish', 'max retries exceeded',
+        'connection refused', 'connection aborted', 'connection reset',
+        'timed out',
+    ))
+
+
 def fetch_coomer_media(
     api_base: str,
     service: str,
@@ -556,7 +579,7 @@ def download_coomer_file(
             response = session.get(
                 cdn_url,
                 headers=headers,
-                timeout=COOMER_TIMEOUT,
+                timeout=(COOMER_CONNECT_TIMEOUT, COOMER_TIMEOUT[1]),
                 stream=True,
                 allow_redirects=True,
             )
@@ -640,6 +663,7 @@ async def iter_coomer(
         total = len(media)
         failed = 0
         last_error = ''
+        cdn_failures = 0
         progress = JOB_PROGRESS.setdefault(job_id, {})
         progress.update(total=total, current=0, current_name='')
 
@@ -675,9 +699,21 @@ async def iter_coomer(
                 failed += 1
                 last_error = str(exc) or type(exc).__name__
                 progress['failed'] = progress.get('failed', 0) + 1
+                if _is_coomer_connection_error(exc):
+                    cdn_failures += 1
+                    if cdn_failures >= COOMER_CDN_FAIL_LIMIT:
+                        raise CoomerError(
+                            f'Coomer CDN unreachable {cdn_failures} times in '
+                            'a row - the CDN node net is down or has no '
+                            'route from this host; try /retry later. Last '
+                            f'error: {last_error}'
+                        )
+                else:
+                    cdn_failures = 0
                 log(f'[coomer] ({index}/{total}) Failed {path}: {last_error}')
                 continue
 
+            cdn_failures = 0
             log(
                 f'[coomer] ({index}/{total}) Downloaded {filename} '
                 f'({format_size(dest.stat().st_size)})'
@@ -724,18 +760,9 @@ client = TelegramClient(SESSION_PATH, API_ID, API_HASH)
 BACKGROUND_TASKS: set[asyncio.Task] = set()
 
 
-def spawn(awaitable) -> asyncio.Future:
-    """Start a background task and keep it referenced until it finishes.
-
-    Accepts coroutines and other awaitables. Telethon's
-    client.disconnect(), for example, returns an asyncio.shield() Future
-    (not a coroutine) while the loop is running; create_task() would
-    reject it with "TypeError: a coroutine was expected".
-    """
-    if asyncio.iscoroutine(awaitable):
-        task = asyncio.create_task(awaitable)
-    else:
-        task = asyncio.ensure_future(awaitable)
+def spawn(coro) -> asyncio.Task:
+    """Start a background task and keep it referenced until it finishes."""
+    task = asyncio.create_task(coro)
     BACKGROUND_TASKS.add(task)
     task.add_done_callback(BACKGROUND_TASKS.discard)
     return task
