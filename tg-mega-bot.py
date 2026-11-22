@@ -724,9 +724,18 @@ client = TelegramClient(SESSION_PATH, API_ID, API_HASH)
 BACKGROUND_TASKS: set[asyncio.Task] = set()
 
 
-def spawn(coro) -> asyncio.Task:
-    """Start a background task and keep it referenced until it finishes."""
-    task = asyncio.create_task(coro)
+def spawn(awaitable) -> asyncio.Future:
+    """Start a background task and keep it referenced until it finishes.
+
+    Accepts coroutines and other awaitables. Telethon's
+    client.disconnect(), for example, returns an asyncio.shield() Future
+    (not a coroutine) while the loop is running; create_task() would
+    reject it with "TypeError: a coroutine was expected".
+    """
+    if asyncio.iscoroutine(awaitable):
+        task = asyncio.create_task(awaitable)
+    else:
+        task = asyncio.ensure_future(awaitable)
     BACKGROUND_TASKS.add(task)
     task.add_done_callback(BACKGROUND_TASKS.discard)
     return task
