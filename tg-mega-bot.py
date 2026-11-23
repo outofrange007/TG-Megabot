@@ -820,6 +820,495 @@ async def iter_coomer(
         session.close()
 
 
+# ---- Coomerfans configuration ----
+# coomerfans.com mirrors Coomer but serves server-rendered HTML instead
+# of a JS shell and exposes no /api JSON endpoints (they all 404), so
+# posts and profiles are scraped from the page. Unlike coomer.st it
+# serves the full videos itself and is not behind the 91.149.227.0/24
+# CDN node net, which makes it the reliable mirror on hosts that cannot
+# route to that net.
+COOMERFANS_DOMAINS = {'coomerfans.com'}
+COOMERFANS_DOMAIN_REGEX = re.compile(r'(?:^|\.)coomerfans\.[a-z]{2,12}$')
+# Candidate URLs in a message; the host is checked afterwards. Posts live
+# at /p/<post_id>/<user_id>/<service>, profiles at /u/<service>/<user_id>/<name>.
+COOMERFANS_URL_REGEX = re.compile(
+    r'https?://[\w.-]*coomerfans\.[a-z]{2,12}/(?:p|u)/[^\s<>"\')]+',
+    re.IGNORECASE,
+)
+# Back-off before retry 1, 2 and 3 after HTTP 429, 5xx or a connection error.
+COOMERFANS_RETRY_DELAYS = (10, 30, 60)
+# (connect, read) timeouts in seconds for Coomerfans page and file requests.
+COOMERFANS_TIMEOUT = (15, 90)
+# Streaming download chunk size.
+COOMERFANS_CHUNK = 8192
+# Pause between two files of a profile, to stay below rate limits.
+COOMERFANS_FILE_DELAY = env_float('COOMERFANS_FILE_DELAY', 1.0)
+# Safety cap for how many posts of a profile are scanned (0 = all).
+COOMERFANS_MAX_POSTS = int(env_float('COOMERFANS_MAX_POSTS', 0))
+# Turning this off (COOMERFANS_ENABLED=0) hides /coomerfans and makes
+# coomerfans.com links inert, leaving the coomer.st path untouched.
+COOMERFANS_ENABLED = (
+    os.environ.get('COOMERFANS_ENABLED', '1').lower()
+    not in ('0', 'false', 'no', '')
+)
+# File suffixes served as post media: images and the full videos.
+COOMERFANS_MEDIA_EXT = (
+    r'(?:jpe?g|png|gif|webp|mp4|m4v|mkv|webm|mov|avi|wmv|flv|mpg|mpeg'
+    r'|3gp|ts)'
+)
+# Suffixes treated as video, only so parse_coomerfans_media can order
+# images before videos (Coomerfans serves real video, not posters).
+COOMERFANS_VIDEO_EXTS = {
+    '.mp4', '.m4v', '.mkv', '.webm', '.mov', '.avi', '.wmv', '.flv',
+    '.mpg', '.mpeg', '.3gp', '.ts',
+}
+# One <img>/<source> src on an img<digit>.coomerfans.com/storage path is
+# post media; the sidebar avatars live under /istorage/ and never match,
+# so they are ignored. Signed media URLs carry a query (?e=..&hash=..).
+COOMERFANS_SRC_REGEX = re.compile(
+    r'src="?(https?://img\d+\.coomerfans\.com/storage/'
+    r'[^"\'\s<>]+?\.' + COOMERFANS_MEDIA_EXT + r'(?:\?[^"\'\s<>]*)?)"?',
+    re.IGNORECASE,
+)
+# Post links collected from a profile page: /p/<post_id>/<user_id>/<service>.
+COOMERFANS_POSTLINK_REGEX = re.compile(r'/p/\d+/\d+/[a-z][\w-]*')
+# Hard ceiling for profile paging so a huge profile does not page forever.
+COOMERFANS_MAX_PAGES = 50
+
+
+class CoomerfansError(RuntimeError):
+    """A Coomerfans page or file could not be fetched or parsed."""
+
+
+def _coomerfans_host(url: str) -> str:
+    """Return the lowercased host of a Coomerfans URL."""
+    return urlsplit(url).hostname.lower() if urlsplit(url).hostname else ''
+
+
+def is_coomerfans_url(url: str) -> bool:
+    """Return True when the URL's host is a Coomerfans mirror domain."""
+    if not COOMERFANS_ENABLED:
+        return False
+    host = _coomerfans_host(url)
+    return host in COOMERFANS_DOMAINS or bool(COOMERFANS_DOMAIN_REGEX.match(host))
+
+
+def parse_coomerfans_link(url: str):
+    """Split a Coomerfans URL into (kind, service, id, name).
+
+    Posts are /p/<post_id>/<user_id>/<service> and return
+    ('post', service, post_id, user_id); profiles are
+    /u/<service>/<user_id>/<username> and return
+    ('profile', service, user_id, username). Returns None otherwise
+    (index, search, static files, an unknown first segment).
+    """
+    parts = urlsplit(url)
+    if parts.scheme not in ('http', 'https'):
+        return None
+    segments = [s for s in parts.path.split('/') if s]
+    if len(segments) != 4:
+        return None
+    if segments[0] == 'p' and segments[1].isdigit() and segments[2].isdigit():
+        service = segments[3].lower()
+        if re.match(r'^[a-z][\w-]*$', service):
+            return ('post', service, segments[1], segments[2])
+    elif segments[0] == 'u' and segments[2].isdigit():
+        service = segments[1].lower()
+        if re.match(r'^[a-z][\w-]*$', service):
+            return ('profile', service, segments[2], segments[3])
+    return None
+
+
+def coomerfans_links_in(text: str) -> list[str]:
+    """Return the Coomerfans profile/post URLs contained in a message text."""
+    urls = []
+    for url in clean_urls(COOMERFANS_URL_REGEX.findall(text)):
+        if is_coomerfans_url(url) and parse_coomerfans_link(url) is not None:
+            urls.append(url)
+    return urls
+
+
+def _coomerfans_unescape(text: str) -> str:
+    """Turn an HTML-escaped '&amp;' back into a real '&' for downloads."""
+    return text.replace('&amp;', '&')
+
+
+def coomerfans_filename(url: str, fallback: str = 'coomerfans_file') -> str:
+    """Return a safe file name from the storage object of a media URL."""
+    candidate = urlsplit(url).path.rsplit('/', 1)[-1]
+    candidate = re.sub(r'[\\/\x00-\x1f]', '', candidate).strip()
+    candidate = re.sub(r'[^\w.\-]+', '_', candidate).strip('._-')
+    if not candidate:
+        candidate = fallback
+    return candidate[:240]
+
+
+def coomerfans_session():
+    """Build a requests session that fetches Coomerfans HTML as a browser.
+
+    coomerfans.com answers with server-rendered HTML, not JSON, so the
+    session asks for text/html like a browser; unlike the coomer.st JSON
+    API it does not need the 'Accept: text/css' trick.
+    """
+    if not HAVE_BUNKR_DEPS:
+        raise CoomerfansError(
+            'Coomerfans support needs the requests package: '
+            'pip install requests'
+        )
+    session = requests.Session()
+    session.headers.update({
+        'User-Agent': COOMER_USER_AGENT,
+        'Accept': (
+            'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+        ),
+    })
+    return session
+
+
+def coomerfans_request(session, url: str, params=None, what: str = 'page'):
+    """GET a Coomerfans URL, retrying on HTTP 429, 5xx and connection errors.
+
+    Returns the response on HTTP 200. HTTP 403/404 raise CoomerfansError
+    right away: a bot block or a missing page is not worth a retry. The
+    caller treats a raised 404 as the end of profile paging.
+    """
+    attempts = len(COOMERFANS_RETRY_DELAYS) + 1
+    for attempt in range(attempts):
+        try:
+            response = session.get(
+                url,
+                params=params,
+                timeout=COOMERFANS_TIMEOUT,
+                allow_redirects=True,
+            )
+        except requests.RequestException as exc:
+            reason = str(exc) or type(exc).__name__
+            if attempt == attempts - 1:
+                raise CoomerfansError(
+                    f'Coomerfans {what} {url} failed after {attempts} '
+                    f'attempts: {reason}'
+                ) from exc
+            delay = COOMERFANS_RETRY_DELAYS[attempt]
+            log(f'[coomerfans] {what} {url}: {reason} - retry in {delay}s')
+            _coomer_sleep(delay)
+            continue
+
+        status = response.status_code
+        if status == 200:
+            return response
+        reason = response.reason or ''
+        if status in (403, 404):
+            raise CoomerfansError(
+                f'HTTP {status} for Coomerfans {what} {url}: {reason}'
+            )
+        if attempt == attempts - 1:
+            raise CoomerfansError(
+                f'HTTP {status} for Coomerfans {what} {url}: {reason}'
+            )
+        delay = COOMERFANS_RETRY_DELAYS[attempt]
+        log(f'[coomerfans] {what} {url}: HTTP {status} - retry in {delay}s')
+        _coomer_sleep(delay)
+    raise CoomerfansError(f'Giving up on Coomerfans {what} {url}')
+
+
+def parse_coomerfans_media(html: str) -> list[str]:
+    """Return the absolute post-media URLs found in a Coomerfans page.
+
+    Only <img>/<source> src values pointing at an
+    img<digit>.coomerfans.com/storage path count as post media; the
+    sidebar avatars served under /istorage/ are never matched and are
+    skipped. A signed query is HTML-escaped as '&amp;' in the page and
+    is turned back into a real '&' here, so the download is not rejected
+    with 403. Images are returned before videos, each de-duplicated in
+    page order.
+    """
+    images: list[str] = []
+    videos: list[str] = []
+    seen: set[str] = set()
+    for raw in COOMERFANS_SRC_REGEX.findall(html):
+        url = _coomerfans_unescape(raw)
+        if url in seen:
+            continue
+        seen.add(url)
+        suffix = Path(urlsplit(url).path).suffix.lower()
+        if suffix in COOMERFANS_VIDEO_EXTS:
+            videos.append(url)
+        else:
+            images.append(url)
+    return images + videos
+
+
+def fetch_coomerfans_media(link: str) -> list[str]:
+    """Return the media URLs of a Coomerfans post or profile.
+
+    A post is a single page: scrape it and parse its media. A profile
+    pages through /u/<service>/<user_id>/<name>?page=<n>, collecting the
+    /p/... post links that belong to the same user on each page and
+    scraping each of those post pages, combining their media. A global
+    seen set de-duplicates URLs across posts. COOMERFANS_MAX_POSTS caps
+    the number of posts scanned (0 = all, up to COOMERFANS_MAX_PAGES).
+    """
+    parsed = parse_coomerfans_link(link)
+    if parsed is None:
+        raise CoomerfansError(f'Not a Coomerfans post or profile URL: {link}')
+    kind = parsed[0]
+    parts = urlsplit(link)
+    api_base = f'{parts.scheme or "https"}://{parts.netloc}'
+
+    session = coomerfans_session()
+    try:
+        if kind == 'post':
+            response = coomerfans_request(session, link, what='post')
+            media = parse_coomerfans_media(response.text)
+            if not media:
+                raise CoomerfansError(
+                    f'Coomerfans post has no downloadable files: {link}'
+                )
+            return media
+
+        _, service, user_id, username = parsed
+        seen: set[str] = set()
+        media: list[str] = []
+        scanned = 0
+        for page in range(1, COOMERFANS_MAX_PAGES + 1):
+            page_url = f'{api_base}/u/{service}/{user_id}/{username}'
+            try:
+                response = coomerfans_request(
+                    session, page_url,
+                    params={'page': page}, what='profile page',
+                )
+            except CoomerfansError as exc:
+                if 'HTTP 404' in str(exc) and page > 1:
+                    break
+                raise
+            page_posts = list(dict.fromkeys(
+                COOMERFANS_POSTLINK_REGEX.findall(response.text)
+            ))
+            # Only this user's own posts, so a shared sidebar of other
+            # profiles' trending posts is not scraped as our media.
+            page_posts = [p for p in page_posts if _coomerfans_same_user(p, user_id)]
+            if not page_posts:
+                break
+            for post in page_posts:
+                if COOMERFANS_MAX_POSTS and scanned >= COOMERFANS_MAX_POSTS:
+                    break
+                post_url = f'{api_base}{post}'
+                try:
+                    post_response = coomerfans_request(
+                        session, post_url, what='post'
+                    )
+                except CoomerfansError as exc:
+                    log(f'[coomerfans] post {post_url} skipped: {exc}')
+                    continue
+                for url in parse_coomerfans_media(post_response.text):
+                    if url not in seen:
+                        seen.add(url)
+                        media.append(url)
+                scanned += 1
+            if COOMERFANS_MAX_POSTS and scanned >= COOMERFANS_MAX_POSTS:
+                log(f'[coomerfans] COOMERFANS_MAX_POSTS={COOMERFANS_MAX_POSTS} reached')
+                break
+        if not media:
+            raise CoomerfansError(
+                f'Coomerfans profile {username} ({service}) has no '
+                'downloadable files'
+            )
+        return media
+    finally:
+        session.close()
+
+
+def _coomerfans_same_user(post: str, user_id: str) -> bool:
+    """Return True when a /p/<post_id>/<user_id>/<service> link is ours."""
+    segments = [s for s in post.split('/') if s]
+    return len(segments) == 4 and segments[0] == 'p' and segments[2] == user_id
+
+
+def download_coomerfans_file(
+    url: str,
+    dest_path: str,
+    progress_cb=None,
+    referer: str = '',
+    session=None,
+    state=None,
+):
+    """Stream a Coomerfans storage file to dest_path and return the final Path.
+
+    Unlike coomer.st the bytes come straight from img<digit>.coomerfans.com,
+    so there is no CDN redirect and no thumbnail fallback. The signed
+    query (kept verbatim; its '&' must not be re-escaped) authorises the
+    URL and a Referer of the post page is sent. HTTP 403/404, an empty
+    body or a short Content-Length raise CoomerfansError so the caller
+    skips that one file. `state` is unused but kept for signature parity.
+    """
+    own_session = session is None
+    session = session or coomerfans_session()
+    headers = {}
+    if referer:
+        headers['Referer'] = referer
+
+    written = 0
+    total = 0
+    try:
+        try:
+            response = session.get(
+                url,
+                headers=headers,
+                timeout=COOMERFANS_TIMEOUT,
+                stream=True,
+                allow_redirects=True,
+            )
+        except requests.RequestException as exc:
+            raise CoomerfansError(
+                f'Coomerfans file {url}: {str(exc) or type(exc).__name__}'
+            ) from exc
+
+        try:
+            if response.status_code != 200:
+                raise CoomerfansError(
+                    f'HTTP {response.status_code} for Coomerfans file {url}'
+                )
+            total = int(response.headers.get('Content-Length') or 0)
+            dest = Path(dest_path)
+            part = dest.with_name(dest.name + '.part')
+            try:
+                with open(part, 'wb') as handle:
+                    for chunk in response.iter_content(COOMERFANS_CHUNK):
+                        if RUNNING['cancel']:
+                            raise JobCancelled()
+                        if not chunk:
+                            continue
+                        written += len(chunk)
+                        handle.write(chunk)
+                        if progress_cb is not None:
+                            progress_cb(written, total)
+            except BaseException:
+                part.unlink(missing_ok=True)
+                raise
+            if written == 0:
+                part.unlink(missing_ok=True)
+                raise CoomerfansError(
+                    f'Coomerfans sent an empty file for {url}'
+                )
+            if total and written != total:
+                part.unlink(missing_ok=True)
+                raise CoomerfansError(
+                    f'Incomplete Coomerfans download: {written} of {total} bytes'
+                )
+            part.replace(dest)
+        finally:
+            response.close()
+        return dest
+    except BaseException:
+        Path(dest_path).with_name(Path(dest_path).name + '.part').unlink(
+            missing_ok=True
+        )
+        raise
+    finally:
+        if own_session:
+            session.close()
+
+
+async def iter_coomerfans(
+    link: str,
+    temp_dir: Path,
+    job_id: int,
+    file_folders: dict[str, str | None] | None = None,
+    status_cb=None,
+):
+    """Download a Coomerfans profile or post file by file, yielding each file.
+
+    Mirrors iter_coomer: one fresh subfolder per file keeps disk usage
+    bounded by the largest file, a broken file does not stop the job,
+    and JOB_PROGRESS feeds /queue. file_folders maps each path to the
+    post/profile title so the worker can route the files into a topic.
+    status_cb(text) is awaited with
+    "Coomerfans: <n>/<total> \u2014 <filename>" before each download.
+    """
+    if RUNNING['cancel']:
+        raise JobCancelled()
+
+    parsed = parse_coomerfans_link(link)
+    if parsed is None:
+        raise CoomerfansError(
+            f'Unsupported Coomerfans URL {link}: expected '
+            '/p/<post_id>/<user_id>/<service> or '
+            '/u/<service>/<user_id>/<name>'
+        )
+    kind = parsed[0]
+    referer = link.rsplit('?', 1)[0]
+
+    session = coomerfans_session()
+    try:
+        media = await asyncio.to_thread(fetch_coomerfans_media, link)
+        if not media:
+            raise CoomerfansError(
+                f'Coomerfans link {link} has no downloadable files'
+            )
+        title = f'coomerfans/{parsed[3]}' if kind == 'profile' else referer
+
+        total = len(media)
+        failed = 0
+        last_error = ''
+        progress = JOB_PROGRESS.setdefault(job_id, {})
+        progress.update(total=total, current=0, current_name='')
+
+        for index, url in enumerate(media, start=1):
+            if RUNNING['cancel']:
+                raise JobCancelled()
+            if index > 1 and COOMERFANS_FILE_DELAY > 0:
+                await asyncio.sleep(COOMERFANS_FILE_DELAY)
+
+            progress['current'] = index
+            filename = coomerfans_filename(url)
+            progress['current_name'] = filename
+            log(f'[coomerfans] ({index}/{total}) Downloading {filename}')
+            if status_cb is not None:
+                await status_cb(f'Coomerfans: {index}/{total} \u2014 {filename}')
+
+            sub_dir = temp_dir / f'coomerfans{index:04d}'
+            sub_dir.mkdir()
+            try:
+                dest = await asyncio.to_thread(
+                    download_coomerfans_file,
+                    url,
+                    str(sub_dir / filename),
+                    make_download_logger(filename, 'coomerfans'),
+                    referer,
+                    session,
+                    None,
+                )
+            except JobCancelled:
+                raise
+            except Exception as exc:
+                # One broken file should not kill the whole profile job.
+                failed += 1
+                last_error = str(exc) or type(exc).__name__
+                progress['failed'] = progress.get('failed', 0) + 1
+                log(f'[coomerfans] ({index}/{total}) Failed {url}: {last_error}')
+                continue
+
+            filename = dest.name
+            progress['current_name'] = filename
+            log(
+                f'[coomerfans] ({index}/{total}) Downloaded {filename} '
+                f'({format_size(dest.stat().st_size)})'
+            )
+            if file_folders is not None:
+                file_folders[str(dest)] = title
+            yield dest
+
+        if failed:
+            log(f'[coomerfans] {failed} of {total} file(s) failed')
+            if failed == total:
+                raise CoomerfansError(
+                    f'All {total} Coomerfans file(s) failed; last error: '
+                    f'{last_error}'
+                )
+    finally:
+        session.close()
+
+
 # ---- Pasted-text hardening ----
 # Invisible Unicode characters (zero-width spaces, direction marks, word
 # joiners) that sneak into messages when text is copied from other chats.
@@ -4142,6 +4631,28 @@ async def _worker_loop() -> None:
                         async for path in downloads:
                             await handle_downloaded(path)
 
+                elif link.startswith("cf:"):
+                    async def coomerfans_status(text: str) -> None:
+                        """Show per-file progress in the start message."""
+                        if start_message is None:
+                            return
+                        try:
+                            await start_message.edit(f"Job #{job_id}: {text}")
+                        except Exception as exc:
+                            log(f"[coomerfans] Status update failed: {exc}")
+
+                    # Same pipeline as MEGA: each downloaded file goes
+                    # through hash dedup, preparation and upload.
+                    async with aclosing(iter_coomerfans(
+                        link[3:],
+                        Path(temp_dir),
+                        job_id,
+                        file_folders,
+                        coomerfans_status,
+                    )) as downloads:
+                        async for path in downloads:
+                            await handle_downloaded(path)
+
                 else:
                     # aclosing() finalizes the generator deterministically
                     # when handle_downloaded() raises, before the temp
@@ -4331,6 +4842,7 @@ async def on_mega(event) -> None:
     # Bunkr URLs pasted alongside MEGA links share the same queue.
     links += [f"bk:{url}" for url in bunkr_links_in(text)]
     links += [f"cm:{url}" for url in coomer_links_in(text)]
+    links += [f"cf:{url}" for url in coomerfans_links_in(text)]
 
     if not links:
         await event.reply(
@@ -4580,6 +5092,72 @@ async def on_coomer(event) -> None:
     )
 
 
+@client.on(events.NewMessage(
+    pattern=rf"^{GAP}/(?:coomerfans|cf)(?:@\w+)?{GAP}(?:\s|$)"
+))
+async def on_coomerfans(event) -> None:
+    """/coomerfans <url(s)> - queue Coomerfans posts or profiles (alias /cf)."""
+    if not is_allowed(event):
+        return
+
+    text = INVISIBLE_RE.sub("", event.raw_text)
+    log(f"[coomerfans] Command from {event.sender_id}: {text!r}")
+
+    force_dupes = bool(DUPES_REGEX.search(text))
+    if force_dupes:
+        text = DUPES_REGEX.sub(" ", text)
+    recode, text = pop_flag(RECODE_REGEX, text)
+
+    links = coomerfans_links_in(text)
+    usage = (
+        "Usage: /coomerfans <coomerfans-post-or-profile-url(s)> "
+        "[-t topic_id] [-newtopic <name>] [-dupes] [-recode]"
+    )
+    if not links:
+        rejected = clean_urls(re.findall(r"https?://\S+", text))
+        if rejected:
+            log(f"[coomerfans] Not a recognised Coomerfans URL: {rejected}")
+            usage = (
+                f"Not a recognised Coomerfans post/profile URL: {rejected[0]}\n"
+                + usage
+            )
+        await event.reply(usage, link_preview=False)
+        return
+
+    topic_id, error = await resolve_target_topic(
+        event, text,
+        "Usage: /coomerfans <coomerfans-url(s)> -newtopic <name> "
+        "[-dupes] [-recode]",
+    )
+    if error:
+        await event.reply(error)
+        return
+
+    # Without an explicit target, each profile gets its own topic named
+    # after the profile, like Bunkr album topics.
+    auto_folder_topics = (
+        not NEWTOPIC_REGEX.search(text)
+        and not TOPIC_REGEX.search(text)
+        and get_topic_id(event) is None
+    )
+    add_jobs(
+        [f"cf:{url}" for url in links],
+        topic_id,
+        event.sender_id,
+        auto_folder_topics=auto_folder_topics,
+        force_dupes=force_dupes,
+        recode=recode,
+    )
+    _, pending = queue_status()
+
+    acknowledgement = await event.reply(
+        f"Saved {len(links)} Coomerfans link(s). Pending: {pending}"
+    )
+    spawn(
+        delete_status([acknowledgement], STATUS_DELETE_DELAY)
+    )
+
+
 @client.on(events.NewMessage(pattern=rf"^{GAP}/queue(?:@\w+)?{GAP}$"))
 async def on_queue(event) -> None:
     """/queue - show running job progress and the pending jobs."""
@@ -4719,6 +5297,9 @@ async def on_help(event) -> None:
         "queue Bunkr albums/files (alias /bk)\n"
         "/coomer <url(s)> [-t <topic_id>] [-newtopic <name>] [-dupes] [-recode] - "
         "queue Coomer profiles/posts (alias /cm)\n"
+        "/coomerfans <url(s)> [-t <topic_id>] [-newtopic <name>] "
+        "[-dupes] [-recode] - "
+        "queue Coomerfans posts/profiles (alias /cf)\n"
         "/queue - show job progress and pending jobs\n"
         "/cancel [job_id] - cancel the running job or remove a pending one\n"
         "/failed - list recent failed jobs\n"
