@@ -316,6 +316,19 @@ COOMER_CONNECT_TIMEOUT = env_float('COOMER_CONNECT_TIMEOUT', 10.0)
 # Consecutive CDN connection failures that abort a profile job early
 # instead of grinding through every file of the profile.
 COOMER_CDN_FAIL_LIMIT = int(env_float('COOMER_CDN_FAIL_LIMIT', 3))
+# When the CDN node net has no route from this host, the same bytes are
+# served through the always-reachable origin as img.<site>/thumbnail/
+# data/<path> (downscaled image, poster for videos). 0 disables it.
+COOMER_THUMBNAIL_FALLBACK = (
+    os.environ.get('COOMER_THUMBNAIL_FALLBACK', '1').lower()
+    not in ('0', 'false', 'no', '')
+)
+# File suffixes treated as video, so a thumbnail poster is renamed to
+# .jpg and never mistaken for a video by the upload pipeline.
+COOMER_VIDEO_EXTS = {
+    '.mp4', '.m4v', '.mkv', '.webm', '.mov', '.avi', '.wmv', '.flv',
+    '.mpg', '.mpeg', '.3gp', '.ts',
+}
 
 
 class CoomerError(RuntimeError):
@@ -551,33 +564,64 @@ def fetch_coomer_media(
     return media
 
 
+def _coomer_thumb_url(cdn_url: str) -> str | None:
+    """Build the origin thumbnail URL (img.<site>/thumbnail/data/<path>).
+
+    Returns None when the URL is not a /data/<path> download on a
+    coomer.<tld> host, so the caller can simply skip the fallback.
+    """
+    host = (urlsplit(cdn_url).hostname or '').lower()
+    base = re.search(r'(coomer\.[a-z0-9.-]+)$', host)
+    tail = re.search(r'/data/([^?#]+)$', cdn_url)
+    if not base or not tail:
+        return None
+    return f'https://img.{base.group(1)}/thumbnail/data/{tail.group(1)}'
+
+
+def _final_coomer_dest(dest: Path, content_type: str, used_thumb: bool) -> Path:
+    """Return the destination path, fixing a poster's extension.
+
+    When the origin thumbnail answered with an image but the original
+    file was a video, the bytes are a poster frame and are stored as a
+    .jpg so the preparation pipeline never runs ffprobe on an image.
+    """
+    p = Path(dest)
+    if used_thumb and content_type.lower().startswith('image/') and p.suffix.lower() in COOMER_VIDEO_EXTS:
+        return p.with_suffix('.jpg')
+    return p
+
+
 def download_coomer_file(
     cdn_url: str,
     dest_path: str,
     progress_cb=None,
     referer: str = '',
     session=None,
-) -> None:
-    """Stream a Coomer /data file to dest_path, following CDN redirects.
+    state=None,
+):
+    """Stream a Coomer /data file to dest_path and return the final Path.
 
-    coomer.st answers with a 302 to a CDN node; requests follows it and
-    the bytes are written in COOMER_CHUNK pieces while progress_cb,
-    when given, receives (current, total). Incomplete transfers raise
-    CoomerError so the caller can move on to the next file.
+    coomer.st answers with a 302 to a CDN node (n3.coomer.st). That node
+    net is not routable from every server; when the connection fails the
+    identical bytes are fetched through the always-reachable origin as
+    img.<site>/thumbnail/data/<path> (a downscaled image, and a poster
+    frame for videos). Via the shared `state` dict the job then keeps
+    using the thumbnail route so no further file wastes the connect
+    timeout, and a video poster is stored as a .jpg. HTTP 404/403 and
+    incomplete transfers raise CoomerError so the caller moves on.
     """
     own_session = session is None
     session = session or coomer_session()
+    thumb_url = _coomer_thumb_url(cdn_url)
+    thumb_only = bool(state and state.get('thumb_only'))
     headers = {}
     if referer:
         headers['Referer'] = referer
-    dest = Path(dest_path)
-    part = dest.with_name(dest.name + '.part')
-    written = 0
-    total = 0
-    try:
+
+    def _open(url: str):
         try:
-            response = session.get(
-                cdn_url,
+            return session.get(
+                url,
                 headers=headers,
                 timeout=(COOMER_CONNECT_TIMEOUT, COOMER_TIMEOUT[1]),
                 stream=True,
@@ -585,35 +629,75 @@ def download_coomer_file(
             )
         except requests.RequestException as exc:
             raise CoomerError(
-                f'Coomer file {cdn_url}: {str(exc) or type(exc).__name__}'
+                f'Coomer file {url}: {str(exc) or type(exc).__name__}'
             ) from exc
+
+    written = 0
+    total = 0
+    try:
+        if thumb_only and thumb_url:
+            url = thumb_url
+            used_thumb = True
+            response = _open(url)
+        else:
+            try:
+                url = cdn_url
+                used_thumb = False
+                response = _open(url)
+            except CoomerError as exc:
+                if not (thumb_url and COOMER_THUMBNAIL_FALLBACK
+                        and _is_coomer_connection_error(exc)):
+                    raise
+                log(
+                    '[coomer] CDN unreachable, using the origin thumbnail '
+                    f'route for this and later files ({cdn_url})'
+                )
+                url = thumb_url
+                used_thumb = True
+                response = _open(url)
+
+        if state is not None and used_thumb:
+            state['thumb_only'] = True
+
         try:
             if response.status_code != 200:
                 raise CoomerError(
-                    f'HTTP {response.status_code} for Coomer file {cdn_url}'
+                    f'HTTP {response.status_code} for Coomer file {url}'
                 )
             total = int(response.headers.get('Content-Length') or 0)
-            with open(part, 'wb') as handle:
-                for chunk in response.iter_content(COOMER_CHUNK):
-                    if RUNNING['cancel']:
-                        raise JobCancelled()
-                    if not chunk:
-                        continue
-                    written += len(chunk)
-                    handle.write(chunk)
-                    if progress_cb is not None:
-                        progress_cb(written, total)
+            content_type = response.headers.get('Content-Type') or ''
+            dest = _final_coomer_dest(Path(dest_path), content_type, used_thumb)
+            part = dest.with_name(dest.name + '.part')
+            try:
+                with open(part, 'wb') as handle:
+                    for chunk in response.iter_content(COOMER_CHUNK):
+                        if RUNNING['cancel']:
+                            raise JobCancelled()
+                        if not chunk:
+                            continue
+                        written += len(chunk)
+                        handle.write(chunk)
+                        if progress_cb is not None:
+                            progress_cb(written, total)
+            except BaseException:
+                part.unlink(missing_ok=True)
+                raise
+            if written == 0:
+                part.unlink(missing_ok=True)
+                raise CoomerError(f'Coomer sent an empty file for {url}')
+            if total and written != total:
+                part.unlink(missing_ok=True)
+                raise CoomerError(
+                    f'Incomplete Coomer download: {written} of {total} bytes'
+                )
+            part.replace(dest)
         finally:
             response.close()
-        if written == 0:
-            raise CoomerError(f'Coomer sent an empty file for {cdn_url}')
-        if total and written != total:
-            raise CoomerError(
-                f'Incomplete Coomer download: {written} of {total} bytes'
-            )
-        part.replace(dest)
+        return dest
     except BaseException:
-        part.unlink(missing_ok=True)
+        Path(dest_path).with_name(Path(dest_path).name + '.part').unlink(
+            missing_ok=True
+        )
         raise
     finally:
         if own_session:
@@ -664,6 +748,7 @@ async def iter_coomer(
         failed = 0
         last_error = ''
         cdn_failures = 0
+        state = {'thumb_only': False}
         progress = JOB_PROGRESS.setdefault(job_id, {})
         progress.update(total=total, current=0, current_name='')
 
@@ -682,15 +767,15 @@ async def iter_coomer(
 
             sub_dir = temp_dir / f'coomer{index:04d}'
             sub_dir.mkdir()
-            dest = sub_dir / filename
             try:
-                await asyncio.to_thread(
+                dest = await asyncio.to_thread(
                     download_coomer_file,
                     f'{api_base}/data/{path}',
-                    str(dest),
+                    str(sub_dir / filename),
                     make_download_logger(filename, 'coomer'),
                     referer,
                     session,
+                    state,
                 )
             except JobCancelled:
                 raise
@@ -714,6 +799,8 @@ async def iter_coomer(
                 continue
 
             cdn_failures = 0
+            filename = dest.name
+            progress['current_name'] = filename
             log(
                 f'[coomer] ({index}/{total}) Downloaded {filename} '
                 f'({format_size(dest.stat().st_size)})'
