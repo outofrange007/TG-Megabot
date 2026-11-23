@@ -288,9 +288,11 @@ BUNKR_FILE_DELAY = env_float("BUNKR_FILE_DELAY", 1.0)
 # host is accepted and a new mirror works without a code change.
 COOMER_DOMAINS = {'coomer.st', 'coomer.su', 'coomer.pet'}
 COOMER_DOMAIN_REGEX = re.compile(r'(?:^|\.)coomer\.[a-z]{2,12}$')
-# Candidate URLs in a message; the host is checked afterwards.
+# Candidate URLs in a message; the host is checked afterwards. The
+# optional query block is captured so a profile link like
+# .../user/<name>?o=50 keeps its offset in the queued "cm:<url>" job.
 COOMER_URL_REGEX = re.compile(
-    r'https?://[\w.-]+/[a-z]+/user/[\w.-]+(?:/\d+)?',
+    r'https?://[\w.-]+/[a-z]+/user/[\w.-]+(?:/\d+)?(?:\?[^\s<>"\')]*)?',
     re.IGNORECASE,
 )
 COOMER_USER_AGENT = (
@@ -456,6 +458,24 @@ def _coomer_api_base(url: str) -> str:
     return f'{parts.scheme or "https"}://{parts.netloc}'
 
 
+def _coomer_start_offset(link: str) -> int:
+    """Read the `?o=<n>` start offset of a Coomer profile link.
+
+    Returns the integer value of the first `o` query parameter so a
+    profile job can start at that posts-endpoint offset. Missing, not a
+    number or negative values fall back to 0, keeping the default of
+    scanning from the first page.
+    """
+    for key, value in parse_qsl(urlsplit(link).query):
+        if key == 'o':
+            try:
+                offset = int(value)
+            except (TypeError, ValueError):
+                return 0
+            return offset if offset > 0 else 0
+    return 0
+
+
 def parse_coomer_media(items: list, seen: set[str]) -> list[tuple[str, str]]:
     """Extract (filename, path) media pairs from post items.
 
@@ -520,12 +540,15 @@ def fetch_coomer_media(
     user: str,
     session,
     post_id: str | None = None,
+    start_offset: int = 0,
 ) -> list[tuple[str, str]]:
     """Return the (filename, path) media of a profile or single post.
 
     Profile links are paginated through the posts endpoint (50 posts
     per page, signalled as HTTP 400 once past the last page) up to
-    COOMER_MAX_POSTS posts. Post links fetch that one post only.
+    COOMER_MAX_POSTS posts. `start_offset` (from a `?o=<n>` profile-link
+    query) sets the first offset scanned; paging then continues from
+    there. Post links fetch that one post only.
     """
     if post_id is not None:
         post_url = f'{api_base}/api/v1/{service}/user/{user}/post/{post_id}'
@@ -539,7 +562,7 @@ def fetch_coomer_media(
     posts_url = f'{api_base}/api/v1/{service}/user/{user}/posts'
     seen: set[str] = set()
     media: list[tuple[str, str]] = []
-    offset = 0
+    offset = start_offset if start_offset > 0 else 0
     scanned = 0
     while True:
         response = coomer_request(
@@ -732,11 +755,13 @@ async def iter_coomer(
     kind, service, user, post_id = parsed
     api_base = _coomer_api_base(link)
     referer = link.rsplit('?', 1)[0]
+    start_offset = _coomer_start_offset(link)
 
     session = coomer_session()
     try:
         media = await asyncio.to_thread(
-            fetch_coomer_media, api_base, service, user, session, post_id
+            fetch_coomer_media, api_base, service, user, session, post_id,
+            start_offset,
         )
         if not media:
             raise CoomerError(
@@ -1038,13 +1063,32 @@ def parse_coomerfans_media(html: str) -> list[str]:
     return images + videos
 
 
+def _coomerfans_start_page(link: str) -> int:
+    """Read the `?page=<n>` start page of a Coomerfans profile link.
+
+    Returns the integer value of the first `page` query parameter so a
+    profile job starts at that page and then pages on as usual. Missing,
+    non-numeric or values below 1 fall back to 1 (start from the top).
+    """
+    for key, value in parse_qsl(urlsplit(link).query):
+        if key == 'page':
+            try:
+                page = int(value)
+            except (TypeError, ValueError):
+                return 1
+            return page if page > 1 else 1
+    return 1
+
+
 def fetch_coomerfans_media(link: str) -> list[str]:
     """Return the media URLs of a Coomerfans post or profile.
 
     A post is a single page: scrape it and parse its media. A profile
     pages through /u/<service>/<user_id>/<name>?page=<n>, collecting the
     /p/... post links that belong to the same user on each page and
-    scraping each of those post pages, combining their media. A global
+    scraping each of those post pages, combining their media. A `?page=N`
+    in the profile link is a start/skip page: paging begins there and
+    then continues to the limit or the end. A global
     seen set de-duplicates URLs across posts. COOMERFANS_MAX_POSTS caps
     the number of posts scanned (0 = all, up to COOMERFANS_MAX_PAGES).
     """
@@ -1067,10 +1111,11 @@ def fetch_coomerfans_media(link: str) -> list[str]:
             return media
 
         _, service, user_id, username = parsed
+        start_page = _coomerfans_start_page(link)
         seen: set[str] = set()
         media: list[str] = []
         scanned = 0
-        for page in range(1, COOMERFANS_MAX_PAGES + 1):
+        for page in range(start_page, COOMERFANS_MAX_PAGES + 1):
             page_url = f'{api_base}/u/{service}/{user_id}/{username}'
             try:
                 response = coomerfans_request(
@@ -1078,7 +1123,7 @@ def fetch_coomerfans_media(link: str) -> list[str]:
                     params={'page': page}, what='profile page',
                 )
             except CoomerfansError as exc:
-                if 'HTTP 404' in str(exc) and page > 1:
+                if 'HTTP 404' in str(exc) and page > start_page:
                     break
                 raise
             page_posts = list(dict.fromkeys(
