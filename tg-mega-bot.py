@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import hashlib
+import http.client
 import json
 import os
 import random
@@ -22,10 +23,14 @@ from pathlib import Path
 from PIL import Image, ImageOps
 from telethon import TelegramClient, events, Button
 from telethon.errors import (
+    FloodWaitError,
     ImageProcessFailedError,
     MediaInvalidError,
     PhotoInvalidDimensionsError,
     PhotoSaveFileInvalidError,
+    RpcCallFailError,
+    ServerError,
+    TimedOutError,
     TopicDeletedError,
 )
 
@@ -180,6 +185,48 @@ BANDWIDTH_REQUEUE_DELAY = env_float("BANDWIDTH_REQUEUE_DELAY", 900)
 
 # Bytes fetched from the storage server per read (also the decrypt unit).
 DOWNLOAD_CHUNK = 1024 * 1024
+
+# Resumable MEGA folder downloads. An interrupted file (cancel, network
+# error, HTTP 509, shutdown) keeps its partial data in MEGA_RESUME_DIR,
+# keyed by the file's node handle, and the next attempt for the same
+# file (in-job retry, automatic re-queue, /retry, container restart)
+# continues from there with a byte-range request. MEGA_RESUME=0
+# restores the old behaviour (partial data is always deleted). Partial
+# files untouched for MEGA_RESUME_MAX_AGE_HOURS are pruned.
+MEGA_RESUME = env_float("MEGA_RESUME", 1) != 0
+MEGA_RESUME_DIR = Path(
+    os.environ.get("MEGA_RESUME_DIR")
+    or (Path(WORK_DIR) if WORK_DIR else DATA_DIR) / "mega-resume"
+)
+MEGA_RESUME_MAX_AGE = env_float("MEGA_RESUME_MAX_AGE_HOURS", 72) * 3600
+# Bytes between two persisted resume checkpoints (data + MAC state).
+MEGA_RESUME_CHECKPOINT = 64 * 1024 * 1024
+# Pause before an in-job retry after a transient network error.
+MEGA_NETWORK_RETRY_DELAY = 10
+
+# Free disk space required before each MEGA download: the file needs
+# room twice (the download itself plus the copy written by the
+# image/video preparation), plus this reserve so the bot never fills
+# the volume completely. Bytes already present in a resumable partial
+# download are subtracted. Without enough room the whole job stops
+# (instead of every remaining file failing one by one); /retry later.
+MIN_FREE_SPACE = env_mib("MIN_FREE_SPACE_MIB", 512)
+DISK_SPACE_FACTOR = 2
+
+# Telegram uploads. Telethon sleeps through short flood waits itself
+# (up to its flood_sleep_threshold of 60s) and raises FloodWaitError
+# for longer ones; send_file() then waits the requested time (plus a
+# small margin) and tries again. Waits longer than
+# UPLOAD_FLOOD_WAIT_MAX seconds fail the upload instead (0 = no cap).
+UPLOAD_FLOOD_WAIT_MAX = env_float("UPLOAD_FLOOD_WAIT_MAX", 3600)
+UPLOAD_FLOOD_WAIT_MARGIN = 2
+# Flood waits honoured per single send before giving up.
+UPLOAD_FLOOD_RETRIES = 5
+# Attempts per upload on transient network / Telegram server errors and
+# the pause between them. Other errors (file too big, bad request) are
+# never retried.
+UPLOAD_RETRIES = max(1, int(env_float("UPLOAD_RETRIES", 3)))
+UPLOAD_RETRY_DELAY = env_float("UPLOAD_RETRY_DELAY", 10)
 
 # Match new and legacy MEGA file/folder links. New-style links may end
 # with a subfolder or file path inside the share, e.g.
@@ -1381,9 +1428,18 @@ client = TelegramClient(SESSION_PATH, API_ID, API_HASH)
 BACKGROUND_TASKS: set[asyncio.Task] = set()
 
 
-def spawn(coro) -> asyncio.Task:
-    """Start a background task and keep it referenced until it finishes."""
-    task = asyncio.create_task(coro)
+def spawn(awaitable) -> asyncio.Future:
+    """Start a background task and keep it referenced until it finishes.
+
+    Accepts coroutines and other awaitables. Telethon's
+    client.disconnect(), for example, returns an asyncio.shield() Future
+    (not a coroutine) while the loop is running; create_task() would
+    reject it with "TypeError: a coroutine was expected".
+    """
+    if asyncio.iscoroutine(awaitable):
+        task = asyncio.create_task(awaitable)
+    else:
+        task = asyncio.ensure_future(awaitable)
     BACKGROUND_TASKS.add(task)
     task.add_done_callback(BACKGROUND_TASKS.discard)
     return task
@@ -1416,7 +1472,9 @@ def clean_urls(raw_urls: list[str]) -> list[str]:
 # The worker processes one job at a time. /cancel talks to it through
 # this shared state; all code runs in the same event loop, so no
 # locking is needed.
-RUNNING = {"job_id": None, "process": None, "cancel": False}
+# "shutdown" is set once on SIGTERM/SIGINT; the worker then keeps
+# "cancel" raised so blocking download threads stop at the next chunk.
+RUNNING = {"job_id": None, "process": None, "cancel": False, "shutdown": False}
 
 # Live progress of the running folder job, keyed by job ID and read
 # by /queue. iter_download writes the position inside the folder
@@ -1543,6 +1601,22 @@ def init_db() -> None:
             )
         """)
 
+        # Before the 'requeued' status existed, a job that the worker had
+        # automatically re-queued (API error -16 / HTTP 509) stayed
+        # 'failed', so a later /retry ran it a second time next to its
+        # follow-up job. Reclassify those: a failed job is superseded
+        # when a later job for the same link carries the next attempt.
+        db.execute("""
+            UPDATE jobs SET status = 'requeued'
+            WHERE status = 'failed'
+              AND EXISTS (
+                  SELECT 1 FROM jobs AS later
+                  WHERE later.link = jobs.link
+                    AND later.id > jobs.id
+                    AND later.retry_attempt = jobs.retry_attempt + 1
+              )
+        """)
+
         # Jobs marked as running were interrupted and should be processed again.
         db.execute(
             "UPDATE jobs SET status = 'pending' WHERE status = 'running'"
@@ -1638,9 +1712,17 @@ def claim_job() -> (
         )
 
 
-def finish_job(job_id: int, error: str | None = None) -> None:
-    """Mark a job as done or failed."""
-    status = "failed" if error else "done"
+def finish_job(
+    job_id: int, error: str | None = None, status: str | None = None
+) -> None:
+    """Mark a job as done or failed (or an explicit status).
+
+    status="requeued" is used when the worker has already queued a
+    follow-up job itself; such jobs are not 'failed', so /retry and
+    /failed leave them alone.
+    """
+    if status is None:
+        status = "failed" if error else "done"
 
     with closing(db_connect()) as db, db:
         db.execute(
@@ -2110,6 +2192,27 @@ class MegaBandwidthLimit(RuntimeError):
     """The storage server refused the download (HTTP 509)."""
 
 
+class MegaTransientError(RuntimeError):
+    """A download broke off for a reason a later attempt may not hit
+    (connection reset, timeout, expired URL, 5xx, short read). Partial
+    data is kept, so the retry resumes instead of starting over."""
+
+
+class MegaResumeInvalid(RuntimeError):
+    """Resumed partial data could not be used (range ignored by the
+    server or MAC mismatch). It was discarded; retry from scratch."""
+
+
+class InsufficientDiskSpace(RuntimeError):
+    """Not enough free disk space for the next MEGA download.
+
+    Stops the whole job: every remaining file would fail the same way.
+    Partial resume data is kept and already uploaded files are skipped
+    through the duplicate registry, so /retry continues cleanly once
+    space has been freed.
+    """
+
+
 def mega_d64(text: str) -> bytes:
     """Decode MEGA's unpadded URL-safe base64."""
     return base64.urlsafe_b64decode(text + "=" * (-len(text) % 4))
@@ -2148,6 +2251,23 @@ def unmerge_key_mac(material: bytes) -> bytes:
     return material[:16]
 
 
+def decrypt_mega_attrs(key: bytes, raw: str) -> dict | None:
+    """Decrypt a node's attribute blob ("a" / "at") with its AES key.
+
+    Attributes are "MEGA" plus a JSON object, zero padded and encrypted
+    with AES-CBC under a zero IV. Returns None when the key is wrong.
+    """
+    try:
+        plain = aes_cbc_decrypt_zero_iv(key, mega_d64(raw))
+        plain = plain.split(b"\x00", 1)[0]
+        if not plain.startswith(b"MEGA{"):
+            return None
+        attrs = json.loads(plain[4:].decode("utf-8"))
+    except Exception:
+        return None
+    return attrs if isinstance(attrs, dict) else None
+
+
 def decrypt_node(node: dict, folder_key: bytes):
     """Decrypt one node's key material and file name.
 
@@ -2167,14 +2287,9 @@ def decrypt_node(node: dict, folder_key: bytes):
             if not raw:
                 return material, None
 
-            plain = aes_cbc_decrypt_zero_iv(
-                unmerge_key_mac(material), mega_d64(raw)
-            )
-            # Attributes are "MEGA" plus a JSON object, zero padded.
-            plain = plain.split(b"\x00", 1)[0]
-            if not plain.startswith(b"MEGA{"):
+            attrs = decrypt_mega_attrs(unmerge_key_mac(material), raw)
+            if attrs is None:
                 continue
-            attrs = json.loads(plain[4:].decode("utf-8"))
             return material, attrs.get("n")
         except Exception:
             continue
@@ -2420,13 +2535,19 @@ class MegaCtrDecryptor:
     keeps it across calls because read chunks are not block aligned.
     """
 
-    def __init__(self, key: bytes, nonce: bytes) -> None:
-        self._counter = int.from_bytes(nonce + bytes(8), "big")
+    def __init__(self, key: bytes, nonce: bytes, offset: int = 0) -> None:
+        # Resuming at a 16-byte aligned offset only advances the counter.
+        if offset % 16:
+            raise ValueError("CTR offset must be a multiple of 16")
+        self._counter = (
+            int.from_bytes(nonce + bytes(8), "big") + offset // 16
+        ) % (1 << 128)
         self._keystream = b""
 
         if HAVE_FAST_CRYPTO:
             self._openssl = Cipher(
-                algorithms.AES(key), modes.CTR(nonce + bytes(8))
+                algorithms.AES(key),
+                modes.CTR(self._counter.to_bytes(16, "big")),
             ).decryptor()
         else:
             self._pyaes = pyaes.AESModeOfOperationECB(key)
@@ -2468,6 +2589,29 @@ class MegaMac:
         self._pos = 0
         self._increment = 131072
         self._pos_next = 131072
+
+    @property
+    def position(self) -> int:
+        """Number of plaintext bytes folded in so far."""
+        return self._pos
+
+    def get_state(self) -> dict:
+        """Serializable state, so a resumed download continues the MAC."""
+        return {
+            "mac": self._mac.hex(),
+            "macs": [item.hex() for item in self._macs],
+            "pos": self._pos,
+            "increment": self._increment,
+            "pos_next": self._pos_next,
+        }
+
+    def set_state(self, state: dict) -> None:
+        """Restore a state produced by get_state()."""
+        self._mac = bytes.fromhex(state["mac"])
+        self._macs = [bytes.fromhex(item) for item in state["macs"]]
+        self._pos = int(state["pos"])
+        self._increment = int(state["increment"])
+        self._pos_next = int(state["pos_next"])
 
     @staticmethod
     def _xor16(left: bytes, right: bytes) -> bytes:
@@ -2530,6 +2674,210 @@ def fetch_download_info(handle: str, folder_handle: str) -> tuple[str, int]:
     return url, int(result.get("s", 0))
 
 
+def fetch_public_file_info(handle: str, key: bytes) -> tuple[str, int, str | None]:
+    """Ask MEGA for a standalone file link's download URL and name.
+
+    Single /file/ links are requested with "p" (public handle) and no
+    folder context. Returns (temporary URL, size, decrypted name or
+    None when the attributes cannot be decrypted with the link key).
+    """
+    result = mega_api([{"a": "g", "g": 1, "ssl": 2, "p": handle}])
+
+    url = result.get("g")
+    if not url:
+        raise RuntimeError(f"No download URL returned for {handle}")
+
+    name = None
+    if result.get("at"):
+        attrs = decrypt_mega_attrs(key, result["at"])
+        if attrs is None:
+            raise RuntimeError(
+                "Could not decrypt the file attributes (wrong key in link?)"
+            )
+        name = attrs.get("n")
+    return url, int(result.get("s", 0)), name
+
+
+def _existing_dir(path: Path) -> Path:
+    """Return path or its nearest existing parent (for disk_usage)."""
+    path = Path(path)
+    while not path.exists() and path != path.parent:
+        path = path.parent
+    return path
+
+
+def check_disk_space(
+    size: int, dest_dir: Path, name: str, resume_key: str | None = None
+) -> None:
+    """Raise InsufficientDiskSpace when a download of `size` won't fit.
+
+    The temp directory needs DISK_SPACE_FACTOR x size (the download and
+    the copy written by the media preparation) plus MIN_FREE_SPACE.
+    Resumable downloads are written to MEGA_RESUME_DIR first; bytes
+    already there are subtracted, and when that directory sits on a
+    different filesystem it is checked separately for the rest of the
+    download.
+    """
+    if size <= 0:
+        return
+
+    resume_part = None
+    resume_bytes = 0
+    if resume_key and MEGA_RESUME:
+        resume_part, _ = mega_resume_paths(resume_key)
+        with suppress(OSError):
+            resume_bytes = min(resume_part.stat().st_size, size)
+
+    temp_dir = _existing_dir(dest_dir)
+    checks: list[tuple[Path, int]] = []
+    temp_need = DISK_SPACE_FACTOR * size
+    if resume_part is not None:
+        resume_dir = _existing_dir(resume_part.parent)
+        if os.stat(resume_dir).st_dev == os.stat(temp_dir).st_dev:
+            # Same filesystem: the finished file is renamed, not copied.
+            temp_need -= resume_bytes
+        else:
+            checks.append((resume_dir, size - resume_bytes))
+    checks.insert(0, (temp_dir, temp_need))
+
+    for directory, need in checks:
+        needed = need + MIN_FREE_SPACE
+        free = shutil.disk_usage(directory).free
+        if free < needed:
+            resumed = (
+                f", {format_size(resume_bytes)} already downloaded"
+                if resume_bytes else ""
+            )
+            raise InsufficientDiskSpace(
+                f"{directory} full: {format_size(free)} free, "
+                f"{format_size(needed)} needed for {name} "
+                f"({format_size(size)}{resumed}, incl. "
+                f"{format_size(MIN_FREE_SPACE)} reserve)"
+            )
+
+
+def mega_resume_paths(node_handle: str) -> tuple[Path, Path]:
+    """Return the (partial data, metadata) paths for a MEGA node."""
+    safe = re.sub(r"[^\w-]", "_", node_handle)
+    return (
+        MEGA_RESUME_DIR / f"{safe}.part",
+        MEGA_RESUME_DIR / f"{safe}.json",
+    )
+
+
+def mega_resume_fingerprint(key: bytes, nonce: bytes, size: int) -> str:
+    """Identify the exact file content a partial download belongs to.
+
+    The node handle alone is not enough: the key and size make sure a
+    partial file is never continued with data of a different file.
+    """
+    return hashlib.sha256(
+        key + nonce + size.to_bytes(8, "big")
+    ).hexdigest()[:32]
+
+
+def discard_mega_resume(part: Path, meta: Path | None) -> None:
+    """Delete partial data and its metadata."""
+    part.unlink(missing_ok=True)
+    if meta is not None:
+        meta.unlink(missing_ok=True)
+        meta.with_name(meta.name + ".tmp").unlink(missing_ok=True)
+
+
+def load_mega_resume(
+    part: Path,
+    meta: Path,
+    fingerprint: str,
+    size: int,
+    need_mac: bool,
+) -> tuple[int, dict | None]:
+    """Return (offset, MAC state) of usable partial data.
+
+    Anything inconsistent (missing metadata, other file, unaligned or
+    too large offset, data shorter than recorded, missing MAC state
+    while the MAC is verified) is discarded and (0, None) returned.
+    """
+    if not part.exists() and not meta.exists():
+        return 0, None
+
+    try:
+        state = json.loads(meta.read_text())
+        offset = int(state.get("offset", 0))
+        valid = (
+            state.get("fingerprint") == fingerprint
+            and 0 < offset <= size
+            and offset % 16 == 0
+            and part.stat().st_size >= offset
+        )
+        mac_state = state.get("mac")
+        if valid and need_mac:
+            valid = bool(mac_state) and int(mac_state.get("pos", -1)) == offset
+    except (OSError, ValueError, TypeError, AttributeError):
+        valid = False
+
+    if not valid:
+        log(f"[dl] Discarding unusable partial download {part.name}")
+        discard_mega_resume(part, meta)
+        return 0, None
+
+    return offset, (mac_state if need_mac else None)
+
+
+def save_mega_resume(
+    meta: Path,
+    fingerprint: str,
+    size: int,
+    offset: int,
+    verifier: "MegaMac | None",
+    name: str,
+) -> bool:
+    """Persist a resume checkpoint for the first `offset` bytes.
+
+    Only 16-byte aligned offsets whose MAC state covers exactly those
+    bytes can be continued; anything else keeps the previous
+    checkpoint. The caller must have flushed the data first.
+    """
+    if offset <= 0 or offset % 16:
+        return False
+    if verifier is not None and verifier.position != offset:
+        return False
+
+    data = {
+        "fingerprint": fingerprint,
+        "name": name,
+        "size": size,
+        "offset": offset,
+        "mac": verifier.get_state() if verifier is not None else None,
+        "updated": time.time(),
+    }
+    tmp = meta.with_name(meta.name + ".tmp")
+    tmp.write_text(json.dumps(data))
+    tmp.replace(meta)
+    return True
+
+
+def prune_mega_resume(max_age: float | None = None) -> int:
+    """Delete resume files untouched for longer than max_age seconds."""
+    if max_age is None:
+        max_age = MEGA_RESUME_MAX_AGE
+    if not MEGA_RESUME_DIR.is_dir():
+        return 0
+
+    cutoff = time.time() - max_age
+    removed = 0
+    for path in MEGA_RESUME_DIR.iterdir():
+        try:
+            if path.is_file() and path.stat().st_mtime < cutoff:
+                path.unlink()
+                removed += 1
+        except OSError:
+            pass
+
+    if removed:
+        log(f"[dl] Pruned {removed} stale partial download file(s)")
+    return removed
+
+
 def download_file_blocking(
     url: str,
     key: bytes,
@@ -2537,73 +2885,233 @@ def download_file_blocking(
     expected_mac: bytes | None,
     size: int,
     dest: Path,
+    resume_key: str | None = None,
 ) -> None:
-    """Download one file from a temporary URL, decrypting it on the fly."""
-    log(f"[dl] Fetching from storage server ({format_size(size)})")
+    """Download one file from a temporary URL, decrypting it on the fly.
 
-    decryptor = MegaCtrDecryptor(key, nonce)
-
+    With resume_key (the MEGA node handle) and MEGA_RESUME enabled, the
+    partial data lives in MEGA_RESUME_DIR and survives cancels, network
+    errors, HTTP 509 and restarts; a later call continues with a
+    byte-range request ("<url>/<start>-<end>", as megajs does) and the
+    persisted MAC state. Otherwise "<dest>.part" is used and deleted on
+    any failure, as before.
+    """
     # MAC verification guards against silent corruption; it is only
     # available with the cryptography package installed.
     verifier = None
     if expected_mac and HAVE_FAST_CRYPTO:
         verifier = MegaMac(key, nonce)
 
-    written = 0
+    fingerprint = mega_resume_fingerprint(key, nonce, size)
+    meta: Path | None = None
+    offset = 0
+
+    if resume_key and MEGA_RESUME and size > 0:
+        MEGA_RESUME_DIR.mkdir(parents=True, exist_ok=True)
+        part, meta = mega_resume_paths(resume_key)
+        offset, mac_state = load_mega_resume(
+            part, meta, fingerprint, size, verifier is not None
+        )
+        if verifier is not None and mac_state:
+            verifier.set_state(mac_state)
+    else:
+        # Write to "<dest>.part" and rename only after all checks
+        # passed (same pattern as the Bunkr downloader).
+        part = dest.with_name(dest.name + ".part")
+
+    if offset:
+        log(
+            f"[dl] Resuming {dest.name} at {format_size(offset)} of "
+            f"{format_size(size)} ({offset / size * 100:.1f}%)"
+        )
+    else:
+        log(f"[dl] Fetching from storage server ({format_size(size)})")
+
+    written = offset
     started = time.monotonic()
     last_log = started
+    last_checkpoint = offset
+    # Whether partial data may survive a failure (decided per error).
+    keep_partial = False
+
+    def checkpoint(out) -> None:
+        """Flush the data, then record how much of it is valid."""
+        nonlocal last_checkpoint
+        out.flush()
+        os.fsync(out.fileno())
+        if save_mega_resume(
+            meta, fingerprint, size, written, verifier, dest.name
+        ):
+            last_checkpoint = written
 
     try:
-        with urllib.request.urlopen(
-            url, timeout=MEGA_API_TIMEOUT
-        ) as response:
-            with open(dest, "wb") as out:
-                while True:
-                    if RUNNING["cancel"]:
-                        raise JobCancelled()
+        if written < size:
+            request_url = f"{url}/{offset}-{size - 1}" if offset else url
+            with urllib.request.urlopen(
+                request_url, timeout=MEGA_API_TIMEOUT
+            ) as response:
+                # A resume needs the server to honour the byte range.
+                length = (
+                    response.headers.get("Content-Length") if offset else None
+                )
+                if length is not None and (
+                    int(length) != size - offset
+                ):
+                    raise MegaResumeInvalid(
+                        f"storage server ignored the byte range "
+                        f"({length} bytes for offset {offset})"
+                    )
 
-                    chunk = response.read(DOWNLOAD_CHUNK)
-                    if not chunk:
-                        break
+                decryptor = MegaCtrDecryptor(key, nonce, offset)
+                with open(part, "r+b" if offset else "wb") as out:
+                    if offset:
+                        # Drop anything written after the checkpoint.
+                        out.truncate(offset)
+                        out.seek(offset)
 
-                    plain = decryptor.update(chunk)
-                    if verifier:
-                        verifier.update(plain)
+                    try:
+                        while True:
+                            if RUNNING["cancel"]:
+                                raise JobCancelled()
 
-                    out.write(plain)
-                    written += len(plain)
+                            chunk = response.read(DOWNLOAD_CHUNK)
+                            if not chunk:
+                                break
 
-                    now = time.monotonic()
-                    if size and now - last_log >= PROGRESS_INTERVAL:
-                        last_log = now
-                        speed = written / max(now - started, 0.001)
-                        log(
-                            f"[dl] {dest.name}: "
-                            f"{written / size * 100:.1f}% "
-                            f"({format_size(written)} of "
-                            f"{format_size(size)}, "
-                            f"{format_size(speed)}/s)"
-                        )
+                            plain = decryptor.update(chunk)
+                            out.write(plain)
+                            written += len(plain)
+                            if verifier:
+                                verifier.update(plain)
+
+                            if written > size:
+                                raise RuntimeError(
+                                    f"Storage server sent more than "
+                                    f"{size} bytes"
+                                )
+
+                            if meta is not None and (
+                                written - last_checkpoint
+                                >= MEGA_RESUME_CHECKPOINT
+                            ):
+                                checkpoint(out)
+
+                            now = time.monotonic()
+                            if now - last_log >= PROGRESS_INTERVAL:
+                                last_log = now
+                                speed = (written - offset) / max(
+                                    now - started, 0.001
+                                )
+                                log(
+                                    f"[dl] {dest.name}: "
+                                    f"{written / size * 100:.1f}% "
+                                    f"({format_size(written)} of "
+                                    f"{format_size(size)}, "
+                                    f"{format_size(speed)}/s)"
+                                )
+                    except BaseException:
+                        # Record the progress made before the failure;
+                        # whether it is kept is decided below.
+                        if meta is not None and written > last_checkpoint:
+                            with suppress(Exception):
+                                checkpoint(out)
+                        raise
+
+                    if meta is not None and written > last_checkpoint:
+                        checkpoint(out)
+
+        if written < size:
+            raise MegaTransientError(
+                f"Incomplete download: {written} of {size} bytes"
+            )
+
+        if verifier and verifier.digest() != expected_mac:
+            if offset:
+                raise MegaResumeInvalid(
+                    "MAC verification failed after resuming; partial "
+                    "data discarded"
+                )
+            raise RuntimeError("MAC verification failed (download is corrupt)")
+
+        if written != size:
+            raise RuntimeError(
+                f"Incomplete download: {written} of {size} bytes"
+            )
+
+        # The resume directory may sit on another filesystem.
+        shutil.move(str(part), str(dest))
+        if meta is not None:
+            discard_mega_resume(part, meta)
+    except JobCancelled:
+        keep_partial = True
+        raise
+    except MegaTransientError:
+        keep_partial = True
+        raise
     except urllib.error.HTTPError as exc:
         if exc.code == 509:
+            keep_partial = True
             raise MegaBandwidthLimit(
                 "MEGA bandwidth limit exceeded (HTTP 509)"
             ) from None
+        if exc.code == 416 and offset:
+            raise MegaResumeInvalid(
+                "storage server rejected the resume range (HTTP 416)"
+            ) from None
+        if exc.code == 403 or exc.code >= 500:
+            # Expired temporary URL or server trouble: a fresh URL on
+            # the next attempt continues from the partial data.
+            keep_partial = True
+            raise MegaTransientError(
+                f"HTTP {exc.code} while downloading"
+            ) from None
         raise RuntimeError(f"HTTP {exc.code} while downloading") from None
+    except (
+        urllib.error.URLError,
+        http.client.HTTPException,
+        OSError,  # connection resets, timeouts, TLS errors
+    ) as exc:
+        keep_partial = True
+        raise MegaTransientError(
+            f"Network error while downloading: {exc}"
+        ) from None
+    finally:
+        if meta is None or not keep_partial:
+            discard_mega_resume(part, meta)
+        elif part.exists():
+            log(
+                f"[dl] Kept partial download of {dest.name} "
+                f"({format_size(last_checkpoint)} of {format_size(size)}) "
+                "for resuming"
+            )
 
-    if verifier and verifier.digest() != expected_mac:
-        raise RuntimeError("MAC verification failed (download is corrupt)")
 
-    if written != size:
-        raise RuntimeError(f"Incomplete download: {written} of {size} bytes")
+async def sleep_cancellable(seconds: float) -> None:
+    """Sleep in short steps and raise JobCancelled on /cancel."""
+    waited = 0.0
+    while waited < seconds:
+        if RUNNING["cancel"]:
+            raise JobCancelled()
+        step = min(1.0, seconds - waited)
+        await asyncio.sleep(step)
+        waited += step
 
 
 async def download_mega_file(
-    folder_handle: str,
+    folder_handle: str | None,
     entry: tuple[str, str, int, bytes, str | None],
     dest_dir: Path,
+    fetch_info=None,
 ) -> Path:
-    """Download one folder file into dest_dir and return its path."""
+    """Download one MEGA file into dest_dir and return its path.
+
+    Transient errors and HTTP 509 are retried (resuming from the kept
+    partial data); unusable partial data is dropped once and the file
+    fetched from scratch. fetch_info, a blocking callable returning
+    (temporary URL, size), replaces the folder-context URL request; the
+    single-file path uses it. Before anything is fetched, the free disk
+    space is checked (InsufficientDiskSpace stops the job).
+    """
     name, handle, size, material = entry[:4]
     key = unmerge_key_mac(material)
     nonce = material[16:24] if len(material) == 32 else bytes(8)
@@ -2612,11 +3120,18 @@ async def download_mega_file(
     # Names can carry the folder path; the file itself gets a flat name.
     dest = dest_dir / (Path(name).name or handle)
 
-    for attempt in range(1, MEGA_DOWNLOAD_RETRIES + 1):
+    check_disk_space(size, dest_dir, dest.name, handle)
+
+    if fetch_info is None:
+        def fetch_info():
+            return fetch_download_info(handle, folder_handle)
+
+    attempt = 0
+    restarted = False
+    while True:
+        attempt += 1
         try:
-            url, info_size = await asyncio.to_thread(
-                fetch_download_info, handle, folder_handle
-            )
+            url, info_size = await asyncio.to_thread(fetch_info)
             await asyncio.to_thread(
                 download_file_blocking,
                 url,
@@ -2625,10 +3140,17 @@ async def download_mega_file(
                 expected_mac,
                 info_size or size,
                 dest,
+                handle,
             )
             return dest
         except JobCancelled:
             raise
+        except MegaResumeInvalid as exc:
+            if restarted:
+                raise RuntimeError(str(exc)) from None
+            restarted = True
+            attempt -= 1
+            log(f"[dl] {exc}; downloading {dest.name} from scratch")
         except MegaBandwidthLimit as exc:
             if attempt >= MEGA_DOWNLOAD_RETRIES:
                 raise
@@ -2637,9 +3159,108 @@ async def download_mega_file(
                 f"[dl] {exc}; retrying in {BANDWIDTH_RETRY_DELAY}s "
                 f"(attempt {attempt + 1}/{MEGA_DOWNLOAD_RETRIES})"
             )
-            await asyncio.sleep(BANDWIDTH_RETRY_DELAY)
+            await sleep_cancellable(BANDWIDTH_RETRY_DELAY)
+        except MegaTransientError as exc:
+            if attempt >= MEGA_DOWNLOAD_RETRIES:
+                raise
 
-    raise RuntimeError("unreachable")
+            log(
+                f"[dl] {exc}; retrying in {MEGA_NETWORK_RETRY_DELAY}s "
+                f"(attempt {attempt + 1}/{MEGA_DOWNLOAD_RETRIES})"
+            )
+            await sleep_cancellable(MEGA_NETWORK_RETRY_DELAY)
+
+
+async def iter_single_file(
+    link: str,
+    temp_dir: Path,
+    job_id: int,
+    stats: dict | None = None,
+    file_folders: dict[str, str | None] | None = None,
+    force_dupes: bool = False,
+    file_handles: dict[str, str] | None = None,
+):
+    """Download a standalone /file/<handle>#<key> link (yields <= 1 file).
+
+    Uses the bot's own downloader, so single files get the same
+    duplicate pre-check (node handle, then name and size), resume,
+    MAC verification, retries and disk space check as folder files.
+    The 32-byte link key has the same layout as folder file keys:
+    AES key merged with nonce (bytes 16-24) and MAC (bytes 24-32).
+    megadl remains the fallback for legacy "#!" links, malformed keys
+    and failed API requests. HTTP 509 still raises MegaBandwidthLimit.
+    """
+    match = re.search(r"/file/([\w-]+)#([\w-]+)", link)
+    material = None
+    if match:
+        try:
+            material = mega_d64(match.group(2))
+        except ValueError:
+            material = None
+
+    if material is None or len(material) != 32:
+        log("[dl] Legacy or unsupported file link; using megadl")
+        for path in await run_megadl(link, temp_dir):
+            yield path
+        return
+
+    handle = match.group(1)
+    key = unmerge_key_mac(material)
+    if MEGA_RESUME:
+        await asyncio.to_thread(prune_mega_resume)
+
+    try:
+        url, size, name = await asyncio.to_thread(
+            fetch_public_file_info, handle, key
+        )
+    except (JobCancelled, MegaBandwidthLimit):
+        raise
+    except Exception as exc:
+        log(f"[dl] File info request failed ({exc}); falling back to megadl")
+        for path in await run_megadl(link, temp_dir):
+            yield path
+        return
+
+    name = name or handle
+    progress = JOB_PROGRESS.setdefault(job_id, {})
+    progress.update(total=1, current=1, current_name=Path(name).name)
+
+    if not force_dupes and stats is not None and size:
+        reason = None
+        if seen_by_node(handle):
+            reason = ("node", "same file node")
+        elif seen_by_name_size(Path(name).name, size):
+            reason = ("name/size", "same name and size")
+        if reason:
+            stats["skipped_pre"] = stats.get("skipped_pre", 0) + 1
+            progress["skipped"] = progress.get("skipped", 0) + 1
+            mark_skipped(Path(name).name, size, reason[0], job_id)
+            log(f"[dl] Skipping {name}: already uploaded ({reason[1]})")
+            return
+
+    log(f"[dl] Downloading {name} ({format_size(size)})")
+    sub_dir = temp_dir / "file0001"
+    sub_dir.mkdir(exist_ok=True)
+
+    # The first attempt reuses the URL fetched above; retries ask again.
+    prefetched = [(url, size)]
+
+    def fetch_info() -> tuple[str, int]:
+        if prefetched:
+            return prefetched.pop()
+        fresh_url, fresh_size, _ = fetch_public_file_info(handle, key)
+        return fresh_url, fresh_size
+
+    path = await download_mega_file(
+        None, (name, handle, size, material, None), sub_dir, fetch_info
+    )
+
+    if file_folders is not None:
+        file_folders[str(path)] = None
+    if file_handles is not None:
+        file_handles[str(path)] = handle
+
+    yield path
 
 
 async def iter_download(
@@ -2659,7 +3280,8 @@ async def iter_download(
     uploaded immediately after its download and disk usage stays
     bounded by the largest single file. If the folder cannot be
     listed, everything is downloaded in one bulk megadl run instead.
-    Single file links are handled by megadl directly. The optional
+    Single file links use the same downloader (see iter_single_file);
+    megadl is only their fallback. The optional
     stats dict collects files skipped before any download; job_id is
     stored with every recorded skip event. file_folders preserves the
     original folder path for per-folder topic routing in the worker,
@@ -2676,13 +3298,20 @@ async def iter_download(
         raise JobCancelled()
 
     if link_kind(link) == "file":
-        for path in await run_megadl(link, temp_dir):
-            yield path
+        async with aclosing(iter_single_file(
+            link, temp_dir, job_id, stats, file_folders, force_dupes,
+            file_handles,
+        )) as downloads:
+            async for path in downloads:
+                yield path
 
         return
 
     match = re.search(r"/folder/([\w-]+)#([\w-]+)", link)
     folder_handle = match.group(1) if match else None
+    if MEGA_RESUME:
+        await asyncio.to_thread(prune_mega_resume)
+
     entries = await list_mega_files(link)
 
     if entries is None or folder_handle is None:
@@ -2750,6 +3379,9 @@ async def iter_download(
         try:
             path = await download_mega_file(folder_handle, entry, sub_dir)
         except JobCancelled:
+            raise
+        except InsufficientDiskSpace:
+            # The next files would not fit either: stop the whole job.
             raise
         except MegaBandwidthLimit:
             # MEGA's bandwidth quota (HTTP 509) is exhausted. Waiting
@@ -2861,6 +3493,68 @@ async def iter_download(
         log(f"[dl] {failed} of {total} file(s) failed")
 
 
+# TemporaryDirectory names: "tmp" plus random lowercase letters,
+# digits and underscores.
+STALE_TEMP_REGEX = re.compile(r"tmp[a-z0-9_]+")
+
+
+def cleanup_stale_temp_dirs() -> tuple[int, int]:
+    """Remove job temp directories left behind by a crash or kill.
+
+    Only runs with an explicit WORK_DIR, only at startup (before the
+    worker starts, so no job can own one), and only touches "tmp*"
+    directories directly inside WORK_DIR. MEGA_RESUME_DIR (and any
+    directory containing it), symlinks, files and the system temporary
+    directory are never removed. Returns (directories removed, bytes
+    freed).
+    """
+    if not WORK_DIR:
+        return 0, 0
+
+    root = Path(WORK_DIR).resolve()
+    system_temp = {
+        Path(tempfile.gettempdir()).resolve(),
+        Path("/tmp").resolve(),
+        Path("/var/tmp").resolve(),
+    }
+    if root in system_temp or not root.is_dir():
+        return 0, 0
+
+    resume_dir = MEGA_RESUME_DIR.resolve()
+    removed = 0
+    freed = 0
+    for child in root.iterdir():
+        try:
+            if (
+                not STALE_TEMP_REGEX.fullmatch(child.name)
+                or child.is_symlink()
+                or not child.is_dir()
+            ):
+                continue
+            resolved = child.resolve()
+            if resolved == resume_dir or resolved in resume_dir.parents:
+                continue
+            size = sum(
+                entry.stat().st_size
+                for entry in resolved.rglob("*")
+                if entry.is_file() and not entry.is_symlink()
+            )
+            shutil.rmtree(resolved)
+        except OSError as exc:
+            log(f"[bot] Could not remove stale temp dir {child}: {exc}")
+            continue
+        removed += 1
+        freed += size
+        log(f"[bot] Removed stale temp dir {child} ({format_size(size)})")
+
+    if removed:
+        log(
+            f"[bot] Cleaned up {removed} stale temp dir(s), "
+            f"{format_size(freed)} freed"
+        )
+    return removed, freed
+
+
 def write_part(src: Path, dst: Path, index: int) -> None:
     """Write one zero-based part of a file to a new file."""
     remaining = PART_SIZE
@@ -2915,14 +3609,94 @@ def make_progress_logger(name: str):
     return callback
 
 
+# Errors worth another upload attempt: connection problems, timeouts
+# and Telegram-side server failures. File-level OSErrors (missing file,
+# permissions) are excluded in send_with_retry().
+UPLOAD_TRANSIENT_ERRORS = (
+    ConnectionError,
+    TimeoutError,
+    asyncio.TimeoutError,
+    OSError,
+    ServerError,  # includes RpcCallFailError
+    RpcCallFailError,
+    TimedOutError,
+)
+UPLOAD_PERMANENT_OS_ERRORS = (
+    FileNotFoundError,
+    PermissionError,
+    IsADirectoryError,
+    NotADirectoryError,
+)
+
+
+async def send_with_retry(path: Path, **kwargs) -> None:
+    """client.send_file() with flood-wait handling and network retries.
+
+    FloodWaitError (raised by Telethon for waits above its 60s
+    flood_sleep_threshold): wait the requested seconds plus a margin,
+    cancellably, then send again; waits above UPLOAD_FLOOD_WAIT_MAX
+    fail instead. Transient network / server errors are retried up to
+    UPLOAD_RETRIES attempts, UPLOAD_RETRY_DELAY seconds apart. All other
+    errors, and JobCancelled (also from the progress callback), are
+    raised immediately.
+    """
+    attempt = 0
+    floods = 0
+    while True:
+        if RUNNING["cancel"]:
+            raise JobCancelled()
+        attempt += 1
+        try:
+            await client.send_file(CHAT_ID, str(path), **kwargs)
+            return
+        except JobCancelled:
+            raise
+        except FloodWaitError as exc:
+            # A flood wait is not a failed attempt.
+            attempt -= 1
+            floods += 1
+            seconds = max(int(getattr(exc, "seconds", 0) or 0), 0)
+            if UPLOAD_FLOOD_WAIT_MAX > 0 and seconds > UPLOAD_FLOOD_WAIT_MAX:
+                raise RuntimeError(
+                    f"Telegram flood wait of {seconds}s for {path.name} "
+                    f"exceeds UPLOAD_FLOOD_WAIT_MAX "
+                    f"({int(UPLOAD_FLOOD_WAIT_MAX)}s); use /retry later"
+                ) from None
+            if floods > UPLOAD_FLOOD_RETRIES:
+                raise
+            wait = seconds + UPLOAD_FLOOD_WAIT_MARGIN
+            log(
+                f"[ul] Telegram flood wait for {path.name}: waiting "
+                f"{wait}s before retrying (flood wait {floods}/"
+                f"{UPLOAD_FLOOD_RETRIES})"
+            )
+            await sleep_cancellable(wait)
+        except UPLOAD_TRANSIENT_ERRORS as exc:
+            if isinstance(exc, UPLOAD_PERMANENT_OS_ERRORS):
+                raise
+            if attempt >= UPLOAD_RETRIES:
+                raise
+            log(
+                f"[ul] Upload of {path.name} failed "
+                f"({type(exc).__name__}: {exc}); retrying in "
+                f"{UPLOAD_RETRY_DELAY:g}s (attempt {attempt + 1}/"
+                f"{UPLOAD_RETRIES})"
+            )
+            await sleep_cancellable(UPLOAD_RETRY_DELAY)
+
+
 async def send_file(path: Path, topic_id: int | None, progress=None) -> None:
-    """Send prepared media; retry Telegram processing errors as a document."""
+    """Send prepared media; retry Telegram processing errors as a document.
+
+    Both sends go through send_with_retry(), so flood waits and
+    transient network errors are handled for media, the document
+    fallback and split parts alike.
+    """
     if RUNNING["cancel"]:
         raise JobCancelled()
     try:
-        await client.send_file(
-            CHAT_ID,
-            str(path),
+        await send_with_retry(
+            path,
             force_document=False,
             supports_streaming=path.suffix.lower() == ".mp4",
             reply_to=topic_id,
@@ -2940,9 +3714,8 @@ async def send_file(path: Path, topic_id: int | None, progress=None) -> None:
             f"[ul] Telegram rejected {path.name} as media "
             f"({type(error).__name__}); retrying prepared file as document"
         )
-        await client.send_file(
-            CHAT_ID,
-            str(path),
+        await send_with_retry(
+            path,
             force_document=True,
             reply_to=topic_id,
             progress_callback=make_progress_logger(path.name),
@@ -4346,6 +5119,11 @@ async def prepare_video_for_telegram(path: Path, recode: bool = True) -> Path:
 
     # Probe the file and decide whether a full re-encode is needed.
     probe = await asyncio.to_thread(_probe_video, path)
+    if probe and probe.get("video_codec") is None:
+        # Audio-only file in a video container (e.g. .mp4/.webm with
+        # just an audio track): "-map 0:V:0" would make FFmpeg fail.
+        log(f"[opt] {path.name} has no video stream; uploading unchanged")
+        return path
     reencode = _needs_reencode(probe)
 
     if reencode:
@@ -4747,9 +5525,36 @@ async def _worker_loop() -> None:
             finish_job(job_id, error="Cancelled by user")
 
             log(f"[worker] Job #{job_id} cancelled by user.")
-            await notify(f"Job #{job_id} cancelled.", topic_id)
+            cancel_text = f"Job #{job_id} cancelled."
+            if MEGA_RESUME and re.match(
+                r"https?://mega\.(?:nz|io)/(?:folder|file)/", link
+            ):
+                # Uploaded files are skipped and the interrupted file
+                # continues from its partial data on the next run.
+                cancel_text += (
+                    f" /retry {job_id} continues where it stopped."
+                )
+            await notify(cancel_text, topic_id)
 
             # Keep the cancellation message visible.
+            spawn(delete_status([start_message], 0))
+
+        except InsufficientDiskSpace as exc:
+            # The work volume is too full for the next file. Stopping
+            # the whole job keeps the remaining files from failing one
+            # by one; partial resume data stays and uploaded files are
+            # skipped by the duplicate registry on /retry.
+            finish_job(job_id, error=f"disk full: {exc}")
+            log(f"[worker] Job #{job_id} stopped: {exc}")
+            await notify(
+                f"Job #{job_id} stopped: {exc}. Free up disk space (or "
+                f"lower MIN_FREE_SPACE_MIB), then /retry {job_id}; "
+                "already sent files are skipped and the interrupted "
+                "download resumes.",
+                topic_id,
+            )
+
+            # Keep the error message visible, like other failures.
             spawn(delete_status([start_message], 0))
 
         except MegaJobAborted as exc:
@@ -4782,6 +5587,11 @@ async def _worker_loop() -> None:
                     retry_attempt=retry_attempt + 1,
                     recode=recode,
                 )[0]
+                finish_job(
+                    job_id,
+                    error=f"re-queued as job #{new_id}: {exc}",
+                    status="requeued",
+                )
                 log(
                     f"[worker] Job #{job_id} re-queued as job #{new_id} "
                     f"with a {next_delay}s per-file delay (run "
@@ -4831,6 +5641,11 @@ async def _worker_loop() -> None:
                     recode=recode,
                     not_before=time.time() + wait,
                 )[0]
+                finish_job(
+                    job_id,
+                    error=f"re-queued as job #{new_id}: paused: {exc}",
+                    status="requeued",
+                )
                 log(
                     f"[worker] Job #{job_id} re-queued as job #{new_id} "
                     f"after a bandwidth pause; it starts in about "
@@ -4858,7 +5673,9 @@ async def _worker_loop() -> None:
             spawn(delete_status([start_message], 0))
 
         finally:
-            RUNNING.update(job_id=None, process=None, cancel=False)
+            RUNNING.update(
+                job_id=None, process=None, cancel=RUNNING["shutdown"]
+            )
             JOB_PROGRESS.pop(job_id, None)
 
         _, pending = queue_status()
@@ -4931,19 +5748,22 @@ async def on_mega(event) -> None:
 
 @client.on(events.NewMessage(pattern=rf"^{GAP}/yt(?:@\w+)?{GAP}(?:\s|$)"))
 async def on_yt(event) -> None:
-    """/yt <url(s)> [-t <topic_id>] [-newtopic <name>] [-recode] - queue YouTube videos."""
+    """/yt <url(s)> [-t <topic_id>] [-newtopic <name>] [-dupes] [-recode] - queue YouTube videos."""
     if not is_allowed(event):
         return
 
     text = INVISIBLE_RE.sub("", event.raw_text)
     log(f"[yt] Command from {event.sender_id}: {text!r}")
+    # "-dupes" re-sends videos the duplicate registry already knows.
+    force_dupes, text = pop_flag(DUPES_REGEX, text)
     recode, text = pop_flag(RECODE_REGEX, text)
 
     urls = clean_urls(YT_REGEX.findall(text))
 
     if not urls:
         await event.reply(
-            "Usage: /yt <youtube-url> [-t topic_id] [-newtopic <name>]"
+            "Usage: /yt <youtube-url> [-t topic_id] [-newtopic <name>] "
+            "[-dupes] [-recode]"
         )
         return
 
@@ -4956,7 +5776,7 @@ async def on_yt(event) -> None:
 
     add_jobs(
         [f"yt:{url}" for url in urls], topic_id, event.sender_id,
-        recode=recode,
+        force_dupes=force_dupes, recode=recode,
     )
     _, pending = queue_status()
 
@@ -4970,19 +5790,22 @@ async def on_yt(event) -> None:
 
 @client.on(events.NewMessage(pattern=rf"^{GAP}/nk(?:@\w+)?{GAP}(?:\s|$)"))
 async def on_nk(event) -> None:
-    """/nk <url(s)> [-t <topic_id>] [-newtopic <name>] [-recode] - queue Netzkino movies."""
+    """/nk <url(s)> [-t <topic_id>] [-newtopic <name>] [-dupes] [-recode] - queue Netzkino movies."""
     if not is_allowed(event):
         return
 
     text = INVISIBLE_RE.sub("", event.raw_text)
     log(f"[nk] Command from {event.sender_id}: {text!r}")
+    # "-dupes" re-sends videos the duplicate registry already knows.
+    force_dupes, text = pop_flag(DUPES_REGEX, text)
     recode, text = pop_flag(RECODE_REGEX, text)
 
     urls = clean_urls(NETZKINO_REGEX.findall(text))
 
     if not urls:
         await event.reply(
-            "Usage: /nk <netzkino-url> [-t topic_id] [-newtopic <name>]"
+            "Usage: /nk <netzkino-url> [-t topic_id] [-newtopic <name>] "
+            "[-dupes] [-recode]"
         )
         return
 
@@ -4995,7 +5818,7 @@ async def on_nk(event) -> None:
 
     add_jobs(
         [f"nk:{url}" for url in urls], topic_id, event.sender_id,
-        recode=recode,
+        force_dupes=force_dupes, recode=recode,
     )
     _, pending = queue_status()
 
@@ -5137,9 +5960,6 @@ async def on_coomer(event) -> None:
     )
 
 
-@client.on(events.NewMessage(
-    pattern=rf"^{GAP}/(?:coomerfans|cf)(?:@\w+)?{GAP}(?:\s|$)"
-))
 async def on_coomerfans(event) -> None:
     """/coomerfans <url(s)> - queue Coomerfans posts or profiles (alias /cf)."""
     if not is_allowed(event):
@@ -5200,6 +6020,17 @@ async def on_coomerfans(event) -> None:
     )
     spawn(
         delete_status([acknowledgement], STATUS_DELETE_DELAY)
+    )
+
+
+# Registered only when enabled: with COOMERFANS_ENABLED=0 the command
+# does not exist at all (no handler, no /help line).
+if COOMERFANS_ENABLED:
+    client.add_event_handler(
+        on_coomerfans,
+        events.NewMessage(
+            pattern=rf"^{GAP}/(?:coomerfans|cf)(?:@\w+)?{GAP}(?:\s|$)"
+        ),
     )
 
 
@@ -5336,16 +6167,21 @@ async def on_help(event) -> None:
         "Available commands:\n"
         "/mega <link(s)> [-t <topic_id>] [-newtopic <name>] [-dupes] [-recode] - "
         "queue MEGA links\n"
-        "/yt <url(s)> [-t <topic_id>] [-newtopic <name>] [-recode] - queue YouTube videos\n"
-        "/nk <url(s)> [-t <topic_id>] [-newtopic <name>] [-recode] - queue Netzkino movies\n"
+        "/yt <url(s)> [-t <topic_id>] [-newtopic <name>] [-dupes] [-recode] - "
+        "queue YouTube videos\n"
+        "/nk <url(s)> [-t <topic_id>] [-newtopic <name>] [-dupes] [-recode] - "
+        "queue Netzkino movies\n"
         "/bunkr <url(s)> [-t <topic_id>] [-newtopic <name>] [-dupes] [-recode] - "
         "queue Bunkr albums/files (alias /bk)\n"
         "/coomer <url(s)> [-t <topic_id>] [-newtopic <name>] [-dupes] [-recode] - "
         "queue Coomer profiles/posts (alias /cm)\n"
-        "/coomerfans <url(s)> [-t <topic_id>] [-newtopic <name>] "
-        "[-dupes] [-recode] - "
-        "queue Coomerfans posts/profiles (alias /cf)\n"
-        "/queue - show job progress and pending jobs\n"
+        + (
+            "/coomerfans <url(s)> [-t <topic_id>] [-newtopic <name>] "
+            "[-dupes] [-recode] - "
+            "queue Coomerfans posts/profiles (alias /cf)\n"
+            if COOMERFANS_ENABLED else ""
+        )
+        + "/queue - show job progress and pending jobs\n"
         "/cancel [job_id] - cancel the running job or remove a pending one\n"
         "/failed - list recent failed jobs\n"
         "/retry [job_id] - re-queue failed jobs\n"
@@ -5561,7 +6397,7 @@ async def on_addtopic(event) -> None:
     )
 
 
-@client.on(events.NewMessage(pattern=rf"^{GAP}/(?:deltopic|topicrooms)(?:@\w+)?{GAP}(?:\s{GAP}(\S+))?(?:\s{GAP}(purge))?{GAP}$"))
+@client.on(events.NewMessage(pattern=rf"^{GAP}/(?:deltopic|topicrooms)(?:@\w+)?{GAP}(?:\s{GAP}(\S+))?(?:\s{GAP}((?i:purge)))?{GAP}$"))
 async def on_deltopic(event) -> None:
     """/deltopic [id|all] [purge] - forget topics; purge also deletes them in Telegram."""
     if not is_allowed(event):
@@ -5713,6 +6549,27 @@ async def main() -> None:
     log(f"[bot] Allowed users: {', '.join(map(str, sorted(ALLOWED_USERS)))}")
     log(f"[bot] Database: {DB_PATH}")
     log(f"[bot] Work dir: {WORK_DIR or 'system temporary directory'}")
+    # No job is running yet: leftovers of a killed run can go.
+    with suppress(OSError):
+        cleanup_stale_temp_dirs()
+    log(
+        f"[bot] Disk check: {DISK_SPACE_FACTOR}x file size + "
+        f"{format_size(MIN_FREE_SPACE)} reserve before each MEGA download"
+    )
+    log(
+        f"[bot] Upload retries: {UPLOAD_RETRIES} attempt(s), "
+        f"{UPLOAD_RETRY_DELAY:g}s apart; flood waits up to "
+        f"{f'{int(UPLOAD_FLOOD_WAIT_MAX)}s' if UPLOAD_FLOOD_WAIT_MAX > 0 else 'any length'}"
+    )
+    if MEGA_RESUME:
+        log(
+            f"[bot] MEGA resume: on ({MEGA_RESUME_DIR}, partial files "
+            f"kept for {MEGA_RESUME_MAX_AGE / 3600:g} h)"
+        )
+        with suppress(OSError):
+            prune_mega_resume()
+    else:
+        log("[bot] MEGA resume: off (MEGA_RESUME=0)")
     log(f"[bot] Status delete delay: {STATUS_DELETE_DELAY}s")
     log(
         f"[bot] AES backend: "
@@ -5773,12 +6630,18 @@ async def main() -> None:
         # Capture the child process first: the worker's cleanup resets
         # RUNNING["process"] while it unwinds.
         process = RUNNING["process"]
+        # Cancel the task first, then raise the flag without an await in
+        # between: the CancelledError reaches the worker before any
+        # JobCancelled from a download thread, so the interrupted job
+        # stays 'running' and is resumed on the next start. The flag
+        # makes blocking download threads (polled per chunk) stop now
+        # instead of running to the end of the current file.
         worker_task.cancel()
+        RUNNING["shutdown"] = True
+        RUNNING["cancel"] = True
         with suppress(asyncio.CancelledError):
             await worker_task
-        # Stop blocking download threads (they poll this flag per chunk)
-        # and any downloader/ffmpeg child that is still alive.
-        RUNNING["cancel"] = True
+        # Also stop any downloader/ffmpeg child that is still alive.
         if process is not None and process.returncode is None:
             with suppress(ProcessLookupError):
                 process.terminate()
