@@ -210,6 +210,93 @@ up to `MEGA_AUTO_RETRIES` times — each run starts with double the
 fail does the job end up in `/failed`, ready for a manual `/retry`
 later.
 
+## Resuming interrupted MEGA downloads
+
+Files from MEGA folder links are resumable. When a download breaks
+off (`/cancel`, connection reset or timeout, expired download URL,
+HTTP 509 bandwidth limit, container stop or restart), the data
+received so far stays in `WORK_DIR/mega-resume/` (keyed by the
+file's MEGA node handle, with a small `.json` checkpoint holding the
+offset and the MAC state). The next attempt for the same file
+continues from that point with a byte-range request instead of
+starting over:
+
+- transient errors are retried inside the job (3 attempts), each
+  attempt continuing where the previous one stopped,
+- the automatic re-queue after HTTP 509 resumes the file,
+- after `/cancel` the bot answers `/retry <job>`; already uploaded
+  files are skipped, the interrupted file is resumed,
+- an interrupted job picked up again after a restart resumes too.
+
+The finished file is still checked against MEGA's MAC. If the
+server ignores the byte range, rejects it, or the MAC does not match
+after a resume, the partial data is discarded and the file is
+downloaded once more from scratch. A checkpoint is written every
+64 MiB and when the download stops; after a hard kill at most the
+data since the last checkpoint is downloaded again.
+
+Standalone file links (`https://mega.nz/file/<handle>#<key>`) use the
+same downloader and are resumable too (see below). Limits: legacy
+`#!` links and folders that cannot be listed are downloaded by
+`megadl` and are not resumable. Partial files count against the
+disk space of `WORK_DIR` and are pruned after
+`MEGA_RESUME_MAX_AGE_HOURS` (default 72 h) without progress.
+`MEGA_RESUME=0` turns the feature off (partial data is deleted
+immediately, as before).
+
+## Single MEGA file links
+
+`/mega https://mega.nz/file/<handle>#<key>` no longer shells out to
+`megadl`. The bot asks the MEGA API for the download URL itself,
+decrypts the file name with the key from the link and downloads the
+file with the same code as folder files. Single files therefore get
+the duplicate check before download (by MEGA node handle, then name
+and size), resume, MAC verification, in-job retries and the disk
+space check. `megadl` remains the fallback for legacy `#!` links and
+when the API request fails (logged as such); an HTTP 509 bandwidth
+limit still pauses and re-queues the job as before.
+
+## Free disk space check
+
+Before each MEGA download (folder files and single files) the bot
+checks the free space of the job's temp directory in `WORK_DIR`. It
+needs twice the file size (the download plus the copy written by the
+image/video preparation) plus `MIN_FREE_SPACE_MIB` (default 512 MiB)
+as a reserve. Bytes already in a resumable partial download are
+subtracted; if `MEGA_RESUME_DIR` lives on a different filesystem, it
+is checked separately for the rest of the download.
+
+Without enough space the **whole job** stops with a message such as
+`Job #12 stopped: /work full: 1.2 GiB free, 3.6 GiB needed ...`
+instead of every remaining file failing one by one. The partial
+download is kept; after freeing space, `/retry <job>` skips the
+already sent files and resumes the interrupted one.
+
+## Upload retries and Telegram flood waits
+
+Telethon sleeps through short flood waits by itself (up to 60 s).
+For longer waits Telegram's `FloodWaitError` used to fail the upload;
+now the bot waits the requested time (plus 2 s), logs it and sends
+again. The pause honours `/cancel` and shutdown. Waits above
+`UPLOAD_FLOOD_WAIT_MAX` (default 3600 s, `0` = no cap) fail the
+upload with a clear message instead of blocking the queue for hours.
+
+Transient errors during an upload (connection reset, timeout,
+Telegram server errors such as `RPC_CALL_FAIL`) are retried up to
+`UPLOAD_RETRIES` attempts (default 3), `UPLOAD_RETRY_DELAY` seconds
+apart (default 10). Other errors (file too big, bad request) are not
+retried. Both apply to normal uploads, the document fallback and
+every part of a split file.
+
+## Stale temp directories
+
+A killed container can leave job temp directories (`tmp*`) behind in
+`WORK_DIR`. At startup, before the worker runs, the bot deletes such
+`tmp*` directories directly inside an explicitly set `WORK_DIR` and
+logs the freed space. `MEGA_RESUME_DIR`, files, symlinks, other
+directories and the system temp directory are never touched; without
+`WORK_DIR` nothing is cleaned up.
+
 ## YouTube cookies (optional)
 
 Public videos work without any login. For age-restricted or
@@ -246,6 +333,13 @@ region for `/nk` to work; elsewhere downloads fail with HTTP 403.
 | `MEGA_FAIL_STREAK` | `10` | Consecutive MEGA failures that trigger a share cooldown |
 | `MEGA_COOLDOWN` | `300` | Seconds a throttled MEGA share is paused before it is probed again |
 | `MEGA_AUTO_RETRIES` | `3` | Automatic re-queue runs for a MEGA job aborted by API error -16; each run doubles `MEGA_FILE_DELAY` |
+| `MEGA_RESUME` | `1` | Keep partial MEGA downloads and resume them on the next attempt (`0` = off) |
+| `MEGA_RESUME_DIR` | `WORK_DIR/mega-resume` | Where partial MEGA downloads are kept (falls back to `DATA_DIR/mega-resume` without `WORK_DIR`) |
+| `MEGA_RESUME_MAX_AGE_HOURS` | `72` | Partial MEGA downloads without progress for this long are deleted |
+| `MIN_FREE_SPACE_MIB` | `512` | Reserve kept free on top of 2x the file size before each MEGA download; less space stops the job |
+| `UPLOAD_RETRIES` | `3` | Upload attempts on transient network / Telegram server errors |
+| `UPLOAD_RETRY_DELAY` | `10` | Seconds between upload attempts |
+| `UPLOAD_FLOOD_WAIT_MAX` | `3600` | Longest Telegram flood wait (seconds) the bot waits out before failing the upload (`0` = no cap) |
 | `BUNKR_FILE_DELAY` | `1.0` | Seconds between consecutive Bunkr file downloads |
 | `SESSION_NAME` | `bot_session` | File name of the Telethon session inside `DATA_DIR` |
 | `VIDEO_REENCODE` | `0` | `1` applies 720p preparation to every job, as if `-recode` were always given |
